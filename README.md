@@ -47,5 +47,21 @@ vendored `tests/conformance/` copy and runs the checks above:
 ## Keeping copies in sync
 
 `conformance/` is the source of truth. Run `./sync.sh` to copy `schema/`,
-`fixtures/` and `manifest.json` into each sibling SDK's `tests/conformance/`.
-(Automating this via submodule or a CI fetch+verify is on the roadmap.)
+`fixtures/` and `manifest.json` into each sibling SDK's vendored directory (paths
+differ per SDK — Go `testdata/`, Java `src/test/resources/`, the rest
+`tests/conformance/`).
+
+Drift is guarded automatically:
+
+- **`./sync.sh --check`** — diffs every vendored copy against the canonical suite
+  and exits non-zero on drift (the local counterpart to the CI guard). Run it
+  before committing fixture changes.
+- **Each core SDK's CI** has a `conformance` job that shallow-clones this repo and
+  diffs its vendored copy against the canonical `manifest.json`/`fixtures/`/`schema/`
+  — so a stale or hand-edited copy turns the SDK's build red.
+- **This repo's CI** validates the canonical suite itself (every fixture/schema is
+  valid JSON, `manifest.schema_version` is 1, and every case's `file` exists with
+  the right `expect`/`reason` block).
+
+So: edit a fixture here → `./sync.sh` → commit each SDK. Forget to re-vendor and CI
+catches it.

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate the canonical conformance suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Every fixture, schema and the manifest is valid JSON
+        run: |
+          set -e
+          for f in manifest.json schema/*.json fixtures/*.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" \
+              || { echo "Invalid JSON: $f"; exit 1; }
+          done
+          echo "✓ all JSON files parse"
+
+      - name: Manifest is internally consistent
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          manifest = json.load(open("manifest.json"))
+          assert manifest.get("schema_version") == 1, "manifest.schema_version must be 1"
+
+          cases = manifest.get("cases", [])
+          assert cases, "manifest has no cases"
+
+          for case in cases:
+              for key in ("name", "file", "valid"):
+                  assert key in case, f"case {case.get('name')!r} missing '{key}'"
+              path = case["file"]
+              assert os.path.exists(path), f"case {case['name']!r} references missing file {path}"
+              json.load(open(path))  # fixture parses
+              if case["valid"]:
+                  assert "expect" in case, f"valid case {case['name']!r} needs an 'expect' block"
+              else:
+                  assert "reason" in case, f"invalid case {case['name']!r} needs a 'reason'"
+
+          print(f"✓ manifest consistent — {len(cases)} cases, all fixtures present")
+          PY
