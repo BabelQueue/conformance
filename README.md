@@ -36,13 +36,51 @@ unique and are asserted for **presence/shape**, not value.
 > the producer JSON Schema (which requires `job`), but a consumer's `accepts()`
 > must still accept it.
 
+## Broker-binding conformance (`manifest.json` → `sqs`)
+
+The `cases` above lock the **envelope** (broker-agnostic). The `sqs` block locks the
+**Amazon SQS binding** ([broker-bindings.md §3](https://babelqueue.com)) — the native
+projection and reconciliation each SQS transport adds on top of the identical body.
+Every SDK that ships an SQS transport must satisfy it:
+
+- **`sqs.attribute_projection`** — encode `attribute_projection.envelope_file`, run the
+  transport's produce-side projection, and assert the resulting native
+  `MessageAttributes` equal `attribute_projection.message_attributes` **exactly** (same
+  keys, `DataType` `String` for ids/strings and `Number` for counters, same `StringValue`).
+- **`sqs.attempts_reconciliation`** — for each case, the consume-side reconciliation MUST
+  yield `expected_attempts` = `max(body_attempts, ApproximateReceiveCount − 1)`: a first
+  delivery reads `0`, an absent/garbage count is ignored, and a runtime-incremented count
+  is never lowered. A **drop-in driver** that instead surfaces the broker's native count
+  (e.g. Laravel's `SqsJob::attempts()` = `ApproximateReceiveCount`) is **exempt** and
+  documents that divergence.
+
+Per-message attribute values reuse `fixtures/order-created.json`, so the expected
+projection is deterministic. SDKs without an SQS transport ignore this block.
+
 ## Running it in an SDK
 
 Each SDK ships a conformance test that loads `manifest.json` + `fixtures/` from its
-vendored `tests/conformance/` copy and runs the checks above:
+vendored `tests/conformance/` copy and runs the **envelope** checks above:
 
 - PHP: `vendor/bin/phpunit` (the `ConformanceTest`).
 - Python: `python -m unittest` / `pytest` (`test_conformance.py`).
+
+The **`sqs`** block is run by each SDK's SQS transport against the same vendored
+manifest — **wired + green in all six**:
+
+| SDK | Test | Reads | `attribute_projection` | `attempts_reconciliation` |
+| :--- | :--- | :--- | :---: | :---: |
+| Go | `babelqueue-go/sqs` `TestSqsConformance` | core's `testdata/conformance/` | ✅ | ✅ |
+| Python | `babelqueue-python` `test_sqs_conformance.py` | `tests/conformance/` | ✅ | ✅ |
+| Node | `@babelqueue/sqs` `sqs-conformance.test.ts` | `test/conformance/` | ✅ | ✅ |
+| Java | `babelqueue-java-sqs` `SqsConformanceTest` | `src/test/resources/conformance/` | ✅ | ✅ |
+| .NET | `babelqueue-dotnet-sqs` `SqsConformanceTests` | copied `conformance/` | ✅ | ✅ |
+| PHP | `php-sdk` `SqsConformanceTest` | `tests/conformance/` | ✅ | n/a¹ |
+
+¹ `php-sdk`'s `SqsTransport` is produce-only; the consume-side reconciliation lives in
+the Laravel `babelqueue-sqs` driver, which surfaces the broker's native count (exempt per
+the block's note). The three standalone transport repos (node-adapters, `babelqueue-java-sqs`,
+`babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
 
 ## Keeping copies in sync
 

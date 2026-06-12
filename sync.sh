@@ -27,6 +27,9 @@ targets=(
   "$root/babelqueue-node/test/conformance"
   "$root/babelqueue-java/src/test/resources/conformance"
   "$root/babelqueue-dotnet/tests/BabelQueue.Core.Tests/conformance"
+  "$root/babelqueue-node-adapters/packages/sqs/test/conformance"
+  "$root/babelqueue-java-sqs/src/test/resources/conformance"
+  "$root/babelqueue-dotnet-sqs/tests/BabelQueue.Sqs.Tests/conformance"
 )
 
 drifted=0
