@@ -39,6 +39,9 @@ targets=(
   "$root/babelqueue-node-adapters/packages/kafka/test/conformance"
   "$root/babelqueue-java-kafka/src/test/resources/conformance"
   "$root/babelqueue-dotnet-kafka/tests/BabelQueue.Kafka.Tests/conformance"
+  "$root/babelqueue-node-adapters/packages/artemis/test/conformance"
+  "$root/babelqueue-java-artemis/src/test/resources/conformance"
+  "$root/babelqueue-dotnet-artemis/tests/BabelQueue.Artemis.Tests/conformance"
 )
 
 drifted=0
