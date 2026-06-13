@@ -36,6 +36,9 @@ targets=(
   "$root/babelqueue-node-adapters/packages/pulsar/test/conformance"
   "$root/babelqueue-java-pulsar/src/test/resources/conformance"
   "$root/babelqueue-dotnet-pulsar/tests/BabelQueue.Pulsar.Tests/conformance"
+  "$root/babelqueue-node-adapters/packages/kafka/test/conformance"
+  "$root/babelqueue-java-kafka/src/test/resources/conformance"
+  "$root/babelqueue-dotnet-kafka/tests/BabelQueue.Kafka.Tests/conformance"
 )
 
 drifted=0

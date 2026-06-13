@@ -36,7 +36,7 @@ unique and are asserted for **presence/shape**, not value.
 > the producer JSON Schema (which requires `job`), but a consumer's `accepts()`
 > must still accept it.
 
-## Broker-binding conformance (`manifest.json` → `sqs`, `asb`, `pulsar`)
+## Broker-binding conformance (`manifest.json` → `sqs`, `asb`, `pulsar`, `kafka`)
 
 The `cases` above lock the **envelope** (broker-agnostic). The `sqs` block locks the
 **Amazon SQS binding** ([broker-bindings.md §3](https://babelqueue.com)) — the native
@@ -103,6 +103,29 @@ The five Pulsar SDKs (`babelqueue-dotnet-pulsar`, `babelqueue-java-pulsar`,
 `@babelqueue/pulsar`, `babelqueue` Python `PulsarTransport`, `babelqueue-go/pulsar`) vendor
 this manifest via `sync.sh`; their conformance runners are wired next. SDKs without a
 Pulsar transport ignore this block.
+
+The `kafka` block locks the **Apache Kafka binding**
+([broker-bindings.md §6](https://babelqueue.com)) the same way. Every SDK that ships a Kafka
+transport must satisfy it:
+
+- **`kafka.property_projection`** — encode `property_projection.envelope_file`, run the
+  transport's produce-side projection, and assert the native record `headers` equal
+  `property_projection.headers` **exactly**. Kafka headers are **bytes**, decoded as UTF-8
+  strings — `bq-job` = the URN, `bq-trace-id` = `trace_id`, `bq-message-id` = `meta.id`, and
+  the stringified `bq-schema-version` (`"1"`), `bq-source-lang`, and `bq-attempts` (`"0"`).
+  The record value stays the byte-identical envelope and the record timestamp mirrors
+  `meta.created_at` (Unix ms).
+- **`kafka.attempts_reconciliation`** — for each case, the consume-side reconciliation MUST
+  yield `expected_attempts` = the **`bq-attempts` header when present** (authoritative — Kafka
+  has no native delivery count), else the body's own `attempts` (the fallback for a
+  non-BabelQueue producer). This is **not a max**: the header overrides the body even when
+  lower. A `null` `header_attempts` means the header is absent. The rule is **identical**
+  across all five Kafka SDKs.
+
+The five Kafka SDKs (`babelqueue-dotnet-kafka`, `babelqueue-java-kafka`, `@babelqueue/kafka`,
+`babelqueue` Python `KafkaTransport`, `babelqueue-go/kafka`) vendor this manifest via
+`sync.sh`; their conformance runners are wired next. SDKs without a Kafka transport ignore
+this block.
 
 ## Running it in an SDK
 
