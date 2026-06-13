@@ -36,7 +36,7 @@ unique and are asserted for **presence/shape**, not value.
 > the producer JSON Schema (which requires `job`), but a consumer's `accepts()`
 > must still accept it.
 
-## Broker-binding conformance (`manifest.json` → `sqs`)
+## Broker-binding conformance (`manifest.json` → `sqs`, `asb`)
 
 The `cases` above lock the **envelope** (broker-agnostic). The `sqs` block locks the
 **Amazon SQS binding** ([broker-bindings.md §3](https://babelqueue.com)) — the native
@@ -56,6 +56,29 @@ Every SDK that ships an SQS transport must satisfy it:
 
 Per-message attribute values reuse `fixtures/order-created.json`, so the expected
 projection is deterministic. SDKs without an SQS transport ignore this block.
+
+The `asb` block locks the **Azure Service Bus binding**
+([broker-bindings.md §4](https://babelqueue.com)) the same way. Every SDK that ships an
+ASB transport must satisfy it:
+
+- **`asb.property_projection`** — encode `property_projection.envelope_file`, run the
+  transport's produce-side projection, and assert the native message fields equal
+  `property_projection.message` (`subject` = the URN, `correlation_id` = `trace_id`,
+  `message_id` = `meta.id`, `content_type` = `application/json`) and the
+  `ApplicationProperties` equal `property_projection.application_properties` **exactly** —
+  as native AMQP-typed values (`bq-schema-version` and `bq-created-at` stay **numbers**,
+  `bq-source-lang` a **string**; not the `DataType`-wrapped strings SQS uses).
+- **`asb.attempts_reconciliation`** — for each case, the consume-side reconciliation MUST
+  yield `expected_attempts` = `max(body_attempts, delivery_count − 1)`: a first delivery
+  (`DeliveryCount` 1) reads `0`, `DeliveryCount ≤ 1` leaves the body's own count untouched,
+  and a runtime-incremented count is never lowered. The rule is **identical** for the
+  native-consumer SDKs (.NET/Java/Node, native `Abandon`) and the Transport+App SDKs
+  (Python/Go, republish-retry).
+
+The five ASB SDKs (`babelqueue-dotnet-azureservicebus`, `babelqueue-java-azureservicebus`,
+`@babelqueue/azure-service-bus`, `babelqueue` Python `AsbTransport`,
+`babelqueue-go/azureservicebus`) vendor this manifest via `sync.sh`; their conformance
+runners are wired next. SDKs without an ASB transport ignore this block.
 
 ## Running it in an SDK
 

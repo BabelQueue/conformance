@@ -30,6 +30,9 @@ targets=(
   "$root/babelqueue-node-adapters/packages/sqs/test/conformance"
   "$root/babelqueue-java-sqs/src/test/resources/conformance"
   "$root/babelqueue-dotnet-sqs/tests/BabelQueue.Sqs.Tests/conformance"
+  "$root/babelqueue-node-adapters/packages/azure-service-bus/test/conformance"
+  "$root/babelqueue-java-azureservicebus/src/test/resources/conformance"
+  "$root/babelqueue-dotnet-azureservicebus/tests/BabelQueue.AzureServiceBus.Tests/conformance"
 )
 
 drifted=0
