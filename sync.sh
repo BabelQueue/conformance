@@ -33,6 +33,9 @@ targets=(
   "$root/babelqueue-node-adapters/packages/azure-service-bus/test/conformance"
   "$root/babelqueue-java-azureservicebus/src/test/resources/conformance"
   "$root/babelqueue-dotnet-azureservicebus/tests/BabelQueue.AzureServiceBus.Tests/conformance"
+  "$root/babelqueue-node-adapters/packages/pulsar/test/conformance"
+  "$root/babelqueue-java-pulsar/src/test/resources/conformance"
+  "$root/babelqueue-dotnet-pulsar/tests/BabelQueue.Pulsar.Tests/conformance"
 )
 
 drifted=0

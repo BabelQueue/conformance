@@ -36,7 +36,7 @@ unique and are asserted for **presence/shape**, not value.
 > the producer JSON Schema (which requires `job`), but a consumer's `accepts()`
 > must still accept it.
 
-## Broker-binding conformance (`manifest.json` → `sqs`, `asb`)
+## Broker-binding conformance (`manifest.json` → `sqs`, `asb`, `pulsar`)
 
 The `cases` above lock the **envelope** (broker-agnostic). The `sqs` block locks the
 **Amazon SQS binding** ([broker-bindings.md §3](https://babelqueue.com)) — the native
@@ -79,6 +79,30 @@ The five ASB SDKs (`babelqueue-dotnet-azureservicebus`, `babelqueue-java-azurese
 `@babelqueue/azure-service-bus`, `babelqueue` Python `AsbTransport`,
 `babelqueue-go/azureservicebus`) vendor this manifest via `sync.sh`; their conformance
 runners are wired next. SDKs without an ASB transport ignore this block.
+
+The `pulsar` block locks the **Apache Pulsar binding**
+([broker-bindings.md §5](https://babelqueue.com)) the same way. Every SDK that ships a
+Pulsar transport must satisfy it:
+
+- **`pulsar.property_projection`** — encode `property_projection.envelope_file`, run the
+  transport's produce-side projection, and assert the native message `properties` equal
+  `property_projection.properties` **exactly**. Pulsar properties are **string→string**, so
+  every value is a string — `bq-job` = the URN, `bq-trace-id` = `trace_id`, `bq-message-id`
+  = `meta.id`, and the stringified `bq-schema-version` (`"1"`), `bq-source-lang`, and
+  `bq-attempts` (`"0"`). The payload stays the byte-identical envelope; the native publish
+  time mirrors `meta.created_at` (broker-set, body authoritative — not asserted).
+- **`pulsar.attempts_reconciliation`** — for each case, the consume-side reconciliation MUST
+  yield `expected_attempts` = `max(body_attempts, redelivery_count)`. Pulsar's
+  `RedeliveryCount` is **0-based** (0 on first delivery) so it maps directly with **no −1**;
+  a runtime-incremented count is never lowered, and `redelivery_count` 0 leaves the body's
+  own count untouched (the runtime retries by republishing with attempts+1, resetting the
+  broker count to 0). The rule is **identical** for the native-consumer SDKs
+  (.NET/Java/Node) and the Transport+App SDKs (Python/Go).
+
+The five Pulsar SDKs (`babelqueue-dotnet-pulsar`, `babelqueue-java-pulsar`,
+`@babelqueue/pulsar`, `babelqueue` Python `PulsarTransport`, `babelqueue-go/pulsar`) vendor
+this manifest via `sync.sh`; their conformance runners are wired next. SDKs without a
+Pulsar transport ignore this block.
 
 ## Running it in an SDK
 
