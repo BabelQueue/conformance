@@ -42,6 +42,10 @@ targets=(
   "$root/babelqueue-node-adapters/packages/artemis/test/conformance"
   "$root/babelqueue-java-artemis/src/test/resources/conformance"
   "$root/babelqueue-dotnet-artemis/tests/BabelQueue.Artemis.Tests/conformance"
+  "$root/babelqueue-node-adapters/packages/redis/test/conformance"
+  "$root/babelqueue-node-adapters/packages/rabbitmq/test/conformance"
+  "$root/babelqueue-java-redis/src/test/resources/conformance"
+  "$root/babelqueue-dotnet-redis/tests/BabelQueue.Redis.Tests/conformance"
 )
 
 drifted=0
