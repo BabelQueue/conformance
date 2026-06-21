@@ -127,6 +127,46 @@ The five Kafka SDKs (`babelqueue-dotnet-kafka`, `babelqueue-java-kafka`, `@babel
 `sync.sh`; their conformance runners are wired next. SDKs without a Kafka transport ignore
 this block.
 
+## Idempotency conformance (`manifest.json` → `idempotency`)
+
+The `idempotency` block locks the **consumer-side dedupe contract** (ADR-0022) that every
+SDK's optional idempotency helper must honour — `idempotency.Wrap` (Go),
+`Idempotent::wrap` (PHP), `idempotency.wrap` (Python), `Wrap` (Node), `Idempotent.wrap`
+(Java). It is **broker-free**: the helper never touches the wire envelope (the `cases`
+above stay byte-identical), so this block governs only the consume-side **decision** —
+*run the handler, or skip-and-ack* — keyed on `meta.id`. Any SDK that ships the helper
+must satisfy it; an SDK without it ignores the block.
+
+- **`idempotency.dedup_key`** — the dedupe key is `meta.id` **verbatim** (the canonical
+  per-message identity, distinct from `trace_id`). Encode `dedup_key.envelope_file` and
+  assert the SDK keys its seen-set on exactly `dedup_key.expected_key` — two deliveries
+  with the same `meta.id` are the **same** message and collapse to one effect; messages
+  sharing a `trace_id` but with distinct `meta.id` are **distinct** effects.
+- **`idempotency.sequences`** — each case drives **one** handler wrapped by the helper,
+  backed by **one** seen-set store, through an ordered `deliveries` list. For each
+  delivery the SDK derives the effect: **`run`** = the wrapped handler is invoked (the
+  side-effect fires) and, on `outcome: "ok"`, the id is remembered; **`skip`** = an
+  already-remembered id is recognised, the handler is **not** invoked, and the delivery
+  is acked. `outcome` is the handler's result for a `run`: `ok` (remembered) or `throw`
+  (raises — the id is left **unmarked**, so a later redelivery runs it again; retry/DLQ
+  still apply). `forget_before: true` evicts the id from the store before that delivery.
+  After replaying the whole sequence, the total number of side-effects (the `run`+`ok`
+  invocations) MUST equal `expected_effects`.
+
+The six sequences pin the whole contract: a duplicate delivery runs **once**; an
+at-least-once redelivery storm is a **no-op**; distinct ids each run; a **throw** leaves
+the id unmarked (retry survives the guard); a missing `meta.id` **fails open** (runs, never
+silently dropped); and `forget` allows a re-run. This is at-least-once delivery collapsed
+to an **exactly-once effect** by the consumer — seen-set, post-success dedupe, **not**
+exactly-once delivery and **not** an in-flight concurrency lock.
+
+The five core SDKs (`php-sdk`, `babelqueue-python`, `babelqueue-go`, `babelqueue-node`,
+`babelqueue-java`) vendor this manifest via `sync.sh`; each runs the block against its
+in-memory reference store. The reference `InMemoryStore` is process-local; the same
+three-method `Store` interface (`seen` / `remember` / `forget`) backs a shared
+Redis/DB store for a fleet — the contract here is **store-agnostic**, it asserts the
+decision sequence, not a backend.
+
 ## Running it in an SDK
 
 Each SDK ships a conformance test that loads `manifest.json` + `fixtures/` from its
