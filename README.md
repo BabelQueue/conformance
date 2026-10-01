@@ -14,6 +14,7 @@ a message one produces is consumable by the other.
 | `schema/message-envelope.schema.json` | The canonical envelope JSON Schema (draft-07). Validates **producer** output (`job` required). |
 | `fixtures/*.json` | Canonical envelopes — one per case (pure envelopes, schema-validatable). |
 | `manifest.json` | The case list: each case's fixture file, whether it's `valid`, and the `expect` values a consumer must derive. Drives a generic runner in any language. |
+| `CONFORMANCE_VERSION` | The suite's SemVer (K-14). Vendored next to `manifest.json` so every SDK records which revision it runs; the canonical repo is tagged `v<version>`. `-pre` = not yet tagged. |
 
 ## What an SDK must do (per `manifest.json` case)
 
@@ -167,6 +168,92 @@ three-method `Store` interface (`seen` / `remember` / `forget`) backs a shared
 Redis/DB store for a fleet — the contract here is **store-agnostic**, it asserts the
 decision sequence, not a backend.
 
+## Behaviour conformance (`manifest.json` → `roundtrip`, `data_shape`, `forbidden_keys`, `payload_schema_unicode`)
+
+These four blocks lock **behaviour** every SDK core must share on top of the envelope
+`cases` — what happens when a message is decoded and written back. A runner that does
+not know a block skips it (all existing runners look sections up by name), so adding a
+block never turns an old runner red. JSON pointers are **RFC 6901** (`/meta/vendor_flag`).
+"Same value" means JSON deep-equality **with type distinction**: `true` ≠ `1`, `{}` ≠ `[]`.
+
+### `roundtrip` — unknown keys survive re-emit
+
+Contract basis: consumers MUST ignore unknown keys ([message-envelope.md](https://babelqueue.com) §4, §8).
+Ignoring must not mean **deleting**: retry, DLQ, redrive and outbox relay all decode and
+re-encode, so an SDK that drops unknown keys silently breaks forward compatibility (GR-5).
+
+Case shape: `{ "name", "file", "description", "expect_attempts", "expect_preserved": { "<pointer>": <value> }, "producer_schema_valid"? }`.
+
+Runner: decode `file` (MUST be accepted) → `attempts + 1` → encode → parse the output and
+assert `attempts == expect_attempts` and every `expect_preserved` pointer holds the given
+value. Key order and whitespace are **not** asserted.
+
+| Case | Expected behaviour |
+| :--- | :--- |
+| `unknown-meta-roundtrip` | `meta.vendor_flag` (`true`) and nested `meta.vendor_ctx` come back unchanged; `attempts` 0 → 1. |
+| `unknown-toplevel-roundtrip` | Top-level `extra_top` (`1`) comes back unchanged; `attempts` 1 → 2. |
+| `unknown-lang` | `meta.lang: "cobol"` decodes without error and is re-emitted as `"cobol"`. |
+| `empty-data-roundtrip` | `data: {}` comes back as an **object** `{}`, never `[]`. |
+
+`producer_schema_valid: false` (on `unknown-lang`) marks a **consumer-tolerance** fixture:
+like `urn-alias`, it intentionally fails the producer JSON Schema (`meta.lang` is an enum
+there) but a consumer MUST still accept and faithfully re-emit it.
+
+### `data_shape` — `data` is always an object
+
+Case shape: `{ "name", "mode": "encode" | "decode", ... }`.
+
+- **`mode: "encode"`** — `{ "urn", "queue", "data", "expect_encoded_data_json" }`. Build a new
+  envelope with the SDK's producer API and assert the raw JSON text of the emitted `data`
+  value, insignificant whitespace removed, equals `expect_encoded_data_json`.
+- **`mode: "decode"`** — `{ "file", "valid", "reason" }`. Decode `file`; the verdict must equal
+  `valid` (`false` = rejected, as for the invalid envelope `cases`).
+
+| Case | Expected behaviour |
+| :--- | :--- |
+| `empty-data` | Encoding an empty map emits `"data":{}` — never `"data":[]` (the PHP pitfall). |
+| `data-array-rejected` | A fixture whose `data` is `[1, 2]` is **rejected** on decode. |
+
+### `forbidden_keys` — warn on decode, never emit
+
+Policy **K-15** (R0 reading): decoding a message that carries a non-canonical key
+([message-envelope.md](https://babelqueue.com) §10) **succeeds with a warning**, so old
+producers keep working; encoding **never** emits the key. The forbidden key is therefore
+**not** captured into the unknown-key extras — otherwise "preserve unknown keys" and
+"never emit forbidden keys" would contradict each other.
+
+Case shape: `{ "name", "file", "forbidden_key": "<pointer>", "expect": "warn", "expect_absent_after_reencode": ["<pointer>", ...] }`.
+
+Runner: decode `file` → MUST succeed **and** the SDK MUST surface at least one warning
+(its logger / warning hook) naming the key → re-encode the decoded message unchanged →
+none of `expect_absent_after_reencode` may exist in the output.
+
+| Case | Expected behaviour |
+| :--- | :--- |
+| `forbidden-key-timestamp` | Top-level `timestamp` → decode warns; re-encoded envelope has no `/timestamp`. |
+| `forbidden-key-meta-max-retries` | `meta.max_retries` → decode warns; re-encoded envelope has no `/meta/max_retries`. |
+| `forbidden-key-meta-attempts` | `meta.attempts` (draft shadow of top-level `attempts`) → decode warns; re-encoded envelope has no `/meta/attempts`; top-level `/attempts` is unaffected. |
+| `forbidden-key-meta-source` | `meta.source` → decode warns; re-encoded envelope has no `/meta/source`. |
+| `forbidden-key-meta-ts` | `meta.ts` → decode warns; re-encoded envelope has no `/meta/ts`. |
+
+### `payload_schema_unicode` — string length is code points
+
+Same shape and runner as `payload_schema`: `{ "schema", "cases": [{ "name", "data", "valid" }] }`.
+`minLength` counts **Unicode code points** — not UTF-8 bytes (Go `len`), not UTF-16 code
+units (Java/.NET/JS `length`), not grapheme clusters (.NET `StringInfo`).
+
+| Case | Value | `minLength` | Code points | Expected |
+| :--- | :--- | :---: | :---: | :--- |
+| `ascii-3cp-min3` | `"abc"` | 3 | 3 | valid |
+| `turkish-2cp-min3` | `"ğü"` | 3 | 2 (4 UTF-8 bytes) | invalid |
+| `turkish-3cp-min3-boundary` | `"ğüş"` | 3 | 3 | valid |
+| `emoji-1cp-min2` | `"😀"` | 2 | 1 (2 UTF-16 units) | invalid |
+| `emoji-plus-ascii-2cp-min3` | `"😀a"` | 3 | 2 (3 UTF-16 units) | invalid |
+| `combining-2cp-min2` | `"é"` (é, decomposed) | 2 | 2 (1 grapheme) | valid |
+
+`maxLength` is deliberately **not** covered: no SDK supports it yet. It arrives with the
+Draft-07 keyword subset in R1 (**K-17**), together with its own cases.
+
 ## Running it in an SDK
 
 Each SDK ships a conformance test that loads `manifest.json` + `fixtures/` from its
@@ -195,7 +282,7 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 ## Keeping copies in sync
 
 `conformance/` is the source of truth. Run `./sync.sh` to copy `schema/`,
-`fixtures/` and `manifest.json` into each sibling SDK's vendored directory (paths
+`fixtures/`, `manifest.json` and `CONFORMANCE_VERSION` into each sibling SDK's vendored directory (paths
 differ per SDK — Go `testdata/`, Java `src/test/resources/`, the rest
 `tests/conformance/`).
 
@@ -209,7 +296,11 @@ Drift is guarded automatically:
   — so a stale or hand-edited copy turns the SDK's build red.
 - **This repo's CI** validates the canonical suite itself (every fixture/schema is
   valid JSON, `manifest.schema_version` is 1, and every case's `file` exists with
-  the right `expect`/`reason` block).
+  the right `expect`/`reason` block). It also checks `CONFORMANCE_VERSION` is SemVer and
+  cross-checks the behaviour blocks against a reference Draft-07 validator (Python
+  `jsonschema`): roundtrip/forbidden-key fixtures pass the envelope schema (except
+  `producer_schema_valid: false`), `data-array-rejected` fails it, every pointer exists
+  in its fixture, and the `payload_schema_unicode` verdicts match.
 
 So: edit a fixture here → `./sync.sh` → commit each SDK. Forget to re-vendor and CI
 catches it.

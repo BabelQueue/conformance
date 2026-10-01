@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # ubuntu-latest's system Python is PEP 668 "externally managed": pip needs its own interpreter.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Every fixture, schema and the manifest is valid JSON
         run: |
           set -e
@@ -47,6 +52,98 @@ jobs:
                   assert "reason" in case, f"invalid case {case['name']!r} needs a 'reason'"
 
           print(f"✓ manifest consistent — {len(cases)} cases, all fixtures present")
+          PY
+
+      - name: CONFORMANCE_VERSION is a SemVer string
+        run: |
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' CONFORMANCE_VERSION \
+            || { echo "CONFORMANCE_VERSION is not SemVer: $(cat CONFORMANCE_VERSION)"; exit 1; }
+          echo "✓ CONFORMANCE_VERSION $(cat CONFORMANCE_VERSION)"
+
+      - name: Install the reference JSON Schema validator
+        run: python3 -m pip install --quiet "jsonschema>=4,<5"
+
+      - name: Behaviour sections agree with the envelope schema
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from jsonschema import Draft7Validator
+
+          manifest = json.load(open("manifest.json"))
+          envelope = Draft7Validator(json.load(open("schema/message-envelope.schema.json")))
+
+          def schema_valid(doc):
+              return not list(envelope.iter_errors(doc))
+
+          def resolve(doc, pointer):
+              # RFC 6901; returns (found, value)
+              node = doc
+              for raw in pointer.split("/")[1:]:
+                  key = raw.replace("~1", "/").replace("~0", "~")
+                  if isinstance(node, dict) and key in node:
+                      node = node[key]
+                  elif isinstance(node, list) and key.isdigit() and int(key) < len(node):
+                      node = node[int(key)]
+                  else:
+                      return False, None
+              return True, node
+
+          def same(a, b):
+              # JSON equality with type distinction (True != 1, {} != [])
+              return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+          def fixture(case):
+              path = case["file"]
+              assert os.path.exists(path), f"{case['name']!r} references missing file {path}"
+              return json.load(open(path))
+
+          total = 0
+
+          for case in manifest["roundtrip"]["cases"]:
+              for key in ("name", "file", "expect_attempts", "expect_preserved"):
+                  assert key in case, f"roundtrip {case.get('name')!r} missing '{key}'"
+              doc = fixture(case)
+              if case.get("producer_schema_valid", True):
+                  assert schema_valid(doc), f"roundtrip {case['name']!r} must pass the envelope schema"
+              else:
+                  assert not schema_valid(doc), f"roundtrip {case['name']!r} is flagged producer_schema_valid:false but passes the schema"
+              assert case["expect_attempts"] == doc["attempts"] + 1, f"roundtrip {case['name']!r}: expect_attempts must be attempts+1"
+              for pointer, value in case["expect_preserved"].items():
+                  found, actual = resolve(doc, pointer)
+                  assert found and same(actual, value), f"roundtrip {case['name']!r}: {pointer} not in fixture with that value"
+              total += 1
+
+          for case in manifest["data_shape"]["cases"]:
+              assert case.get("mode") in ("encode", "decode"), f"data_shape {case.get('name')!r} needs mode encode|decode"
+              if case["mode"] == "encode":
+                  for key in ("urn", "queue", "data", "expect_encoded_data_json"):
+                      assert key in case, f"data_shape {case['name']!r} missing '{key}'"
+                  assert isinstance(case["data"], dict), f"data_shape {case['name']!r}: data must be an object"
+                  assert same(json.loads(case["expect_encoded_data_json"]), case["data"]), f"data_shape {case['name']!r}: expected JSON disagrees with data"
+              else:
+                  for key in ("file", "valid", "reason"):
+                      assert key in case, f"data_shape {case['name']!r} missing '{key}'"
+                  assert schema_valid(fixture(case)) == case["valid"], f"data_shape {case['name']!r}: schema verdict != valid"
+              total += 1
+
+          for case in manifest["forbidden_keys"]["cases"]:
+              for key in ("name", "file", "forbidden_key", "expect", "expect_absent_after_reencode"):
+                  assert key in case, f"forbidden_keys {case.get('name')!r} missing '{key}'"
+              assert case["expect"] == "warn", f"forbidden_keys {case['name']!r}: R0 policy is warn (K-15)"
+              doc = fixture(case)
+              assert schema_valid(doc), f"forbidden_keys {case['name']!r} must still pass the envelope schema"
+              assert resolve(doc, case["forbidden_key"])[0], f"forbidden_keys {case['name']!r}: fixture lacks {case['forbidden_key']}"
+              assert case["forbidden_key"] in case["expect_absent_after_reencode"]
+              total += 1
+
+          section = manifest["payload_schema_unicode"]
+          validator = Draft7Validator(section["schema"])  # Python len() counts code points
+          for case in section["cases"]:
+              verdict = not list(validator.iter_errors(case["data"]))
+              assert verdict == case["valid"], f"payload_schema_unicode {case['name']!r}: reference verdict {verdict} != {case['valid']}"
+              total += 1
+
+          print(f"✓ behaviour sections consistent — {total} cases")
           PY
 
   ci-green:

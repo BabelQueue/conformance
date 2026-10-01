@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Vendor the canonical conformance suite into each sibling SDK, or verify that the
 # vendored copies are in sync. conformance/ is the single source of truth.
+# Copied per target: manifest.json, CONFORMANCE_VERSION, fixtures/, schema/.
 #
 #   ./sync.sh            # copy the canonical suite into each SDK (run after edits)
 #   ./sync.sh --check    # diff vendored copies vs canonical; exit 1 on any drift
@@ -59,6 +60,7 @@ for dest in "${targets[@]}"; do
 
   if [ "$mode" = "check" ]; then
     if diff -q "$here/manifest.json" "$dest/manifest.json" >/dev/null 2>&1 \
+      && diff -q "$here/CONFORMANCE_VERSION" "$dest/CONFORMANCE_VERSION" >/dev/null 2>&1 \
       && diff -qr "$here/fixtures" "$dest/fixtures" >/dev/null 2>&1 \
       && diff -qr "$here/schema" "$dest/schema" >/dev/null 2>&1; then
       echo "in sync: $dest"
@@ -70,6 +72,7 @@ for dest in "${targets[@]}"; do
     rm -rf "$dest"
     mkdir -p "$dest/fixtures" "$dest/schema"
     cp "$here/manifest.json" "$dest/manifest.json"
+    cp "$here/CONFORMANCE_VERSION" "$dest/CONFORMANCE_VERSION"
     cp "$here"/fixtures/*.json "$dest/fixtures/"
     cp "$here"/schema/*.json "$dest/schema/"
     echo "synced -> $dest"
