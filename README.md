@@ -291,9 +291,10 @@ Drift is guarded automatically:
 - **`./sync.sh --check`** — diffs every vendored copy against the canonical suite
   and exits non-zero on drift (the local counterpart to the CI guard). Run it
   before committing fixture changes.
-- **Each core SDK's CI** has a `conformance` job that shallow-clones this repo and
-  diffs its vendored copy against the canonical `manifest.json`/`fixtures/`/`schema/`
-  — so a stale or hand-edited copy turns the SDK's build red.
+- **Each SDK's CI** has a `conformance` job that shallow-clones this repo **at the release
+  tag it pins** (`git clone --depth 1 --branch vX.Y.Z …`) and diffs its vendored copy against that
+  tag's `CONFORMANCE_VERSION`/`manifest.json`/`fixtures/`/`schema/` — so a stale or hand-edited
+  copy turns the SDK's build red, and unreleased changes on `main` never break an SDK's CI.
 - **This repo's CI** validates the canonical suite itself (every fixture/schema is
   valid JSON, `manifest.schema_version` is 1, and every case's `file` exists with
   the right `expect`/`reason` block). It also checks `CONFORMANCE_VERSION` is SemVer and
@@ -302,5 +303,8 @@ Drift is guarded automatically:
   `producer_schema_valid: false`), `data-array-rejected` fails it, every pointer exists
   in its fixture, and the `payload_schema_unicode` verdicts match.
 
-So: edit a fixture here → `./sync.sh` → commit each SDK. Forget to re-vendor and CI
-catches it.
+So, to release a suite change: edit fixtures here → bump `CONFORMANCE_VERSION` → commit, push
+and tag `vX.Y.Z` → `./sync.sh` → in each SDK, commit the vendored copy together with the
+`--branch vX.Y.Z` bump in its `ci.yml`. CI catches a copy that disagrees with its pinned tag (re-vendored
+without the pin bump, or the reverse); an SDK left behind on both the old copy and the old pin
+stays green, so run `./sync.sh --check` here to find it.
