@@ -47,6 +47,10 @@ targets=(
   "$root/babelqueue-node-adapters/packages/rabbitmq/test/conformance"
   "$root/babelqueue-java-redis/src/test/resources/conformance"
   "$root/babelqueue-dotnet-redis/tests/BabelQueue.Redis.Tests/conformance"
+  "$root/babelqueue-spring/src/test/resources/conformance"
+  "$root/babelqueue-dotnet-masstransit/tests/BabelQueue.MassTransit.Tests/conformance"
+  "$root/laravel/tests/conformance"
+  "$root/symfony/tests/conformance"
 )
 
 drifted=0

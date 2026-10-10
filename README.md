@@ -37,7 +37,7 @@ unique and are asserted for **presence/shape**, not value.
 > the producer JSON Schema (which requires `job`), but a consumer's `accepts()`
 > must still accept it.
 
-## Broker-binding conformance (`manifest.json` → `sqs`, `asb`, `pulsar`, `kafka`)
+## Broker-binding conformance (`manifest.json` → `sqs`, `asb`, `pulsar`, `kafka`, `artemis`)
 
 The `cases` above lock the **envelope** (broker-agnostic). The `sqs` block locks the
 **Amazon SQS binding** ([broker-bindings.md §3](https://babelqueue.com)) — the native
@@ -127,6 +127,34 @@ The five Kafka SDKs (`babelqueue-dotnet-kafka`, `babelqueue-java-kafka`, `@babel
 `babelqueue` Python `KafkaTransport`, `babelqueue-go/kafka`) vendor this manifest via
 `sync.sh`; their conformance runners are wired next. SDKs without a Kafka transport ignore
 this block.
+
+### `schema_version_gate` — version-gate before decoding (`sqs`, `asb`, `kafka`, `artemis`, `pulsar`)
+
+Each of the five broker blocks also carries a **`schema_version_gate`** table that locks the
+consumer-side version gate ([broker-bindings.md](https://babelqueue.com) §3.7 / §4.7 / §5.7 /
+§6.7 / §7.7) across SDKs. The table names the native `property` the gate reads
+(`bq-schema-version` for SQS, ASB, Kafka and Pulsar; `bq_schema_version` — underscores, ADR-0017 —
+for Artemis), the `fixture` that is always the (valid) message body, and a list of `cases`, each
+with either a `value` or `"absent": true`, and the `expect`ed verdict:
+
+- **`decode`** — the gate lets the message through to the normal decode path: value `"1"`, or an
+  **absent** or **blank** property. Blank means the empty string or only ASCII whitespace
+  (space, `\t`, `\n`, `\v`, `\f`, `\r`) — the same set in every SDK. (The body's
+  `meta.schema_version` check still runs afterwards.)
+- **`reject`** — the gate rejects/quarantines the message **without decoding the body**
+  (poison/DLQ path): any other present value. The value is compared as-is and is **never
+  trimmed**: `"2"`, `"01"`, `"x"`, `" 1"`, `"1 "` and `"\t1\n"` all reject, and so do values made
+  of **non-ASCII** whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF) — those are *not*
+  blank. A gate that trims before comparing, or that uses a unicode-aware blank check
+  (`str.isspace()`, `char.IsWhiteSpace`, `Character.isWhitespace`), fails these cases.
+
+The `asb` table additionally has JSON-**number** cases, because ASB `ApplicationProperties` are
+AMQP-typed and `bq-schema-version` is a native number there: **any AMQP integral type**
+(byte/short/int/long, signed or unsigned) with value `1` decodes; any other numeric value (`2`,
+`0`, non-integral `1.5`) and any other type rejects. A JSON number carries no width, so a runner
+MUST exercise integral `1` and `2` at both **int32 and int64** width. A floating-point `1.0` is
+unspecified and not tested. Since the body is always valid, a `reject` verdict can only come from
+the property gate. SDKs that have not yet wired a runner for this key ignore it.
 
 ## Idempotency conformance (`manifest.json` → `idempotency`)
 
@@ -278,6 +306,12 @@ manifest — **wired + green in all six**:
 the Laravel `babelqueue-sqs` driver, which surfaces the broker's native count (exempt per
 the block's note). The three standalone transport repos (node-adapters, `babelqueue-java-sqs`,
 `babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
+
+## Suite version history
+
+- **1.1.0** — adds `schema_version_gate` to the `sqs`, `asb`, `kafka`, `artemis` and `pulsar`
+  blocks (additive; no existing block, fixture or schema changed).
+- **1.0.0** — initial tagged suite.
 
 ## Keeping copies in sync
 

@@ -146,6 +146,85 @@ jobs:
           print(f"✓ behaviour sections consistent — {total} cases")
           PY
 
+      - name: Broker schema_version_gate tables are well-formed
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from jsonschema import Draft7Validator
+
+          manifest = json.load(open("manifest.json"))
+          envelope = Draft7Validator(json.load(open("schema/message-envelope.schema.json")))
+
+          # broker -> native property carrying the schema version (Artemis uses underscores, ADR-0017)
+          BROKERS = {
+              "sqs": "bq-schema-version",
+              "asb": "bq-schema-version",
+              "pulsar": "bq-schema-version",
+              "kafka": "bq-schema-version",
+              "artemis": "bq_schema_version",
+          }
+          NUMERIC_BROKERS = {"asb"}  # AMQP-typed numeric property values are only meaningful on ASB
+          ASCII_BLANK = " \t\n\v\f\r"  # the only whitespace that counts as blank; never trimmed
+
+          def oracle(value):
+              # Reference gate (broker-bindings.md §3.7/§4.7/§5.7/§6.7/§7.7): blank falls through to decode,
+              # exactly "1" decodes, everything else is rejected without decoding.
+              if isinstance(value, str):
+                  return "decode" if (all(c in ASCII_BLANK for c in value) or value == "1") else "reject"
+              return "decode" if value == 1 else "reject"
+
+          REQUIRED = [  # cases every broker table must lock
+              {"absent": True}, {"value": ""}, {"value": " "}, {"value": "1"},
+              {"value": "2"}, {"value": " 1"}, {"value": "1 "},
+              {"value": "\u00a0"}, {"value": "\u0085"}, {"value": "\u3000"}, {"value": "\ufeff"},
+          ]
+
+          total = 0
+          for broker, prop in BROKERS.items():
+              block = manifest.get(broker)
+              assert isinstance(block, dict), f"manifest.{broker} block missing"
+              gate = block.get("schema_version_gate")
+              assert isinstance(gate, dict), f"{broker}: schema_version_gate missing"
+              assert set(gate) == {"description", "property", "fixture", "cases"}, f"{broker}: unexpected gate keys {sorted(gate)}"
+              assert isinstance(gate["description"], str) and gate["description"].strip(), f"{broker}: description must be a non-empty string"
+              assert gate["property"] == prop, f"{broker}: property must be {prop!r}, got {gate['property']!r}"
+              assert os.path.exists(gate["fixture"]), f"{broker}: fixture {gate['fixture']} does not exist"
+              assert not list(envelope.iter_errors(json.load(open(gate["fixture"])))), f"{broker}: fixture {gate['fixture']} must pass the envelope schema"
+
+              cases = gate["cases"]
+              assert isinstance(cases, list) and cases, f"{broker}: cases must be a non-empty list"
+              seen = set()
+              for case in cases:
+                  assert isinstance(case, dict), f"{broker}: case must be an object: {case!r}"
+                  keys = set(case)
+                  assert keys in ({"value", "expect"}, {"absent", "expect"}), f"{broker}: case needs 'expect' plus exactly one of 'value' or 'absent': {case!r}"
+                  assert case["expect"] in ("decode", "reject"), f"{broker}: expect must be decode|reject: {case!r}"
+                  if "absent" in case:
+                      assert case["absent"] is True, f"{broker}: 'absent' must be true: {case!r}"
+                      ident = ("absent",)
+                      want = "decode"
+                  else:
+                      value = case["value"]
+                      is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+                      assert isinstance(value, str) or is_number, f"{broker}: value must be a string (or a number on {sorted(NUMERIC_BROKERS)}): {case!r}"
+                      assert not is_number or broker in NUMERIC_BROKERS, f"{broker}: numeric value only allowed on {sorted(NUMERIC_BROKERS)}: {case!r}"
+                      ident = (type(value).__name__, value)
+                      want = oracle(value)
+                  assert ident not in seen, f"{broker}: duplicate case {case!r}"
+                  seen.add(ident)
+                  assert case["expect"] == want, f"{broker}: {case!r} disagrees with the reference gate (expected {want})"
+                  total += 1
+
+              for req in REQUIRED:
+                  ident = ("absent",) if "absent" in req else ("str", req["value"])
+                  assert ident in seen, f"{broker}: required gate case missing: {req!r}"
+              if broker in NUMERIC_BROKERS:
+                  for n in (1, 2):  # ASB must lock the AMQP-numeric accept (1) and reject (2) cases
+                      assert ("int", n) in seen, f"{broker}: numeric case {n} missing"
+
+          print(f"✓ schema_version_gate tables well-formed — {len(BROKERS)} brokers, {total} cases")
+          PY
+
   ci-green:
     name: CI green
     runs-on: ubuntu-latest
