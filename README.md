@@ -152,9 +152,21 @@ The `asb` table additionally has JSON-**number** cases, because ASB `Application
 AMQP-typed and `bq-schema-version` is a native number there: **any AMQP integral type**
 (byte/short/int/long, signed or unsigned) with value `1` decodes; any other numeric value (`2`,
 `0`, non-integral `1.5`) and any other type rejects. A JSON number carries no width, so a runner
-MUST exercise integral `1` and `2` at both **int32 and int64** width. A floating-point `1.0` is
-unspecified and not tested. Since the body is always valid, a `reject` verdict can only come from
-the property gate. SDKs that have not yet wired a runner for this key ignore it.
+MUST exercise integral `1` and `2` at both **int32 and int64** width. A floating-point `1.0`
+is a native AMQP float/double, **not** integral `1`, and rejects. JSON parsers in several
+languages (Go, Node) cannot tell `1.0` from `1`, so that case carries an explicit
+`"value_type": "float"` marker and a runner MUST hand the SDK a real floating-point value
+(`float32` and `float64` where the language has both), never an integer. A language with a
+single number type (JavaScript: an AMQP float `1.0` arrives as the number `1`) cannot represent
+the case and its runner skips it explicitly; this is the documented JavaScript exception in
+[broker-bindings.md §4.7](https://babelqueue.com), where such a runtime MAY accept float `1.0`
+as `1`. A reader that ignores the marker sees `1` and fails the case loudly rather than passing
+silently. Since the body is always valid, a `reject` verdict can only come from the property
+gate. SDKs that have not yet wired a runner for this key ignore it.
+
+The `asb` table also has a `{"value": null, "expect": "decode"}` case: a property that is present
+with a null value is treated exactly like an absent one, so the runner MUST put the key into the
+message with a null value (not omit it). Null cases for the other bindings are not locked yet.
 
 ## Idempotency conformance (`manifest.json` → `idempotency`)
 
@@ -309,6 +321,11 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 
 ## Suite version history
 
+- **1.2.0** — adds the `asb` `schema_version_gate` case `{"value": 1.0, "value_type": "float",
+  "expect": "reject"}` (a floating-point `1.0` is not integral `1`) and the optional `value_type`
+  case key; adds `{"value": null, "expect": "decode"}` (a present-but-null property is treated as
+  absent); removes the "unspecified and not tested" note. Additive: no existing case, block,
+  fixture or schema changed.
 - **1.1.0** — adds `schema_version_gate` to the `sqs`, `asb`, `kafka`, `artemis` and `pulsar`
   blocks (additive; no existing block, fixture or schema changed).
 - **1.0.0** — initial tagged suite.
