@@ -32,6 +32,13 @@ Decode each fixture with the SDK's core, then:
 Per-message fields (`meta.id`, `trace_id`, `meta.created_at`) are intrinsically
 unique and are asserted for **presence/shape**, not value.
 
+**Exact key spelling, last wins.** Envelope keys (`job`, `urn`, `trace_id`, `data`, `meta` and
+its members, `attempts`, `dead_letter`) are matched **case-sensitively**: `JOB`, `Data` or
+`meta.Queue` is an *unknown key* — never the canonical field — and is preserved and re-emitted
+like any other unknown key (`invalid-wrong-case-job`, `wrong-case-keys-roundtrip`). A key that
+appears twice follows **last wins** and is never merged (`duplicate-keys-last-wins`: the second
+`job` and the second `data` object replace the first).
+
 > Note: `urn-alias.json` uses `urn` instead of `job`. That is a **consumer
 > tolerance**, not valid *producer* output — so it intentionally would NOT pass
 > the producer JSON Schema (which requires `job`), but a consumer's `accepts()`
@@ -237,6 +244,7 @@ value. Key order and whitespace are **not** asserted.
 | `unknown-toplevel-roundtrip` | Top-level `extra_top` (`1`) comes back unchanged; `attempts` 1 → 2. |
 | `unknown-lang` | `meta.lang: "cobol"` decodes without error and is re-emitted as `"cobol"`. |
 | `empty-data-roundtrip` | `data: {}` comes back as an **object** `{}`, never `[]`. |
+| `wrong-case-keys-roundtrip` | A valid envelope that also carries `JOB`, `Data` and `meta.Queue`: the canonical `job` / `data` / `meta.queue` are unchanged and the three wrongly cased keys come back with their own values; `attempts` 0 → 1. |
 
 `producer_schema_valid: false` (on `unknown-lang`) marks a **consumer-tolerance** fixture:
 like `urn-alias`, it intentionally fails the producer JSON Schema (`meta.lang` is an enum
@@ -324,6 +332,11 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 
 ## Suite version history
 
+- **1.3.0** — adds the `cases` entries `invalid-wrong-case-job` (a `JOB` key is not `job`: the
+  message has no identity) and `duplicate-keys-last-wins` (repeated `job` / `data` keys: last
+  wins, never merged), and the `roundtrip` case `wrong-case-keys-roundtrip` (wrongly cased
+  keys are unknown keys and survive re-emit). Additive: no existing case, block, fixture or
+  schema changed; the Go core was the only one that needed a decode change.
 - **1.2.0** — adds the `asb` `schema_version_gate` case `{"value": 1.0, "value_type": "float",
   "expect": "reject"}` (a floating-point `1.0` is not integral `1`) and the optional `value_type`
   case key; adds `{"value": null, "expect": "decode"}` to the `asb`, `kafka` and `artemis` gates (a
