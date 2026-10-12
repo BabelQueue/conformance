@@ -164,6 +164,7 @@ jobs:
               "artemis": "bq_schema_version",
           }
           NUMERIC_BROKERS = {"asb"}  # AMQP-typed numeric property values are only meaningful on ASB
+          NULL_BROKERS = {"asb", "kafka", "artemis"}  # SQS and Pulsar cannot carry a present-but-null property
           ASCII_BLANK = " \t\n\v\f\r"  # the only whitespace that counts as blank; never trimmed
 
           def oracle(value):
@@ -197,7 +198,7 @@ jobs:
               for case in cases:
                   assert isinstance(case, dict), f"{broker}: case must be an object: {case!r}"
                   keys = set(case)
-                  assert keys in ({"value", "expect"}, {"absent", "expect"}), f"{broker}: case needs 'expect' plus exactly one of 'value' or 'absent': {case!r}"
+                  assert keys in ({"value", "expect"}, {"value", "value_type", "expect"}, {"absent", "expect"}), f"{broker}: case needs 'expect' plus exactly one of 'value' or 'absent' (optional 'value_type' with 'value'): {case!r}"
                   assert case["expect"] in ("decode", "reject"), f"{broker}: expect must be decode|reject: {case!r}"
                   if "absent" in case:
                       assert case["absent"] is True, f"{broker}: 'absent' must be true: {case!r}"
@@ -205,11 +206,25 @@ jobs:
                       want = "decode"
                   else:
                       value = case["value"]
+                      if value is None:
+                          # a present-but-null property (header) is treated exactly like an absent one (README)
+                          assert broker in NULL_BROKERS, f"{broker}: null value only allowed on {sorted(NULL_BROKERS)}: {case!r}"
+                          assert "value_type" not in case, f"{broker}: value_type does not apply to null: {case!r}"
+                          ident = ("null",)
+                          assert ident not in seen, f"{broker}: duplicate case {case!r}"
+                          seen.add(ident)
+                          assert case["expect"] == "decode", f"{broker}: {case!r} disagrees with the reference gate (expected decode)"
+                          total += 1
+                          continue
                       is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
                       assert isinstance(value, str) or is_number, f"{broker}: value must be a string (or a number on {sorted(NUMERIC_BROKERS)}): {case!r}"
                       assert not is_number or broker in NUMERIC_BROKERS, f"{broker}: numeric value only allowed on {sorted(NUMERIC_BROKERS)}: {case!r}"
-                      ident = (type(value).__name__, value)
-                      want = oracle(value)
+                      value_type = case.get("value_type")
+                      # "float" marks a native floating-point value a JSON reader may not tell from an integer (README)
+                      assert value_type in (None, "float"), f"{broker}: value_type must be 'float' when present: {case!r}"
+                      assert value_type is None or is_number, f"{broker}: value_type only applies to a numeric value: {case!r}"
+                      ident = (value_type or type(value).__name__, value)
+                      want = "reject" if value_type == "float" else oracle(value)
                   assert ident not in seen, f"{broker}: duplicate case {case!r}"
                   seen.add(ident)
                   assert case["expect"] == want, f"{broker}: {case!r} disagrees with the reference gate (expected {want})"
@@ -221,6 +236,8 @@ jobs:
               if broker in NUMERIC_BROKERS:
                   for n in (1, 2):  # ASB must lock the AMQP-numeric accept (1) and reject (2) cases
                       assert ("int", n) in seen, f"{broker}: numeric case {n} missing"
+              if broker in NULL_BROKERS:
+                  assert ("null",) in seen, f"{broker}: null case missing"
 
           print(f"✓ schema_version_gate tables well-formed — {len(BROKERS)} brokers, {total} cases")
           PY
