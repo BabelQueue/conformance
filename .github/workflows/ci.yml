@@ -223,6 +223,8 @@ jobs:
                       # "float" marks a native floating-point value a JSON reader may not tell from an integer (README)
                       assert value_type in (None, "float"), f"{broker}: value_type must be 'float' when present: {case!r}"
                       assert value_type is None or is_number, f"{broker}: value_type only applies to a numeric value: {case!r}"
+                      # an integral float (1.0) reads back as an int in most JSON readers, so it must carry the marker
+                      assert not (isinstance(value, float) and value.is_integer()) or value_type == "float", f"{broker}: an integral float literal needs value_type 'float': {case!r}"
                       ident = (value_type or type(value).__name__, value)
                       want = "reject" if value_type == "float" else oracle(value)
                   assert ident not in seen, f"{broker}: duplicate case {case!r}"
@@ -236,6 +238,7 @@ jobs:
               if broker in NUMERIC_BROKERS:
                   for n in (1, 2):  # ASB must lock the AMQP-numeric accept (1) and reject (2) cases
                       assert ("int", n) in seen, f"{broker}: numeric case {n} missing"
+                  assert ("float", 1.0) in seen, f"{broker}: float case 1.0 missing"
               if broker in NULL_BROKERS:
                   assert ("null",) in seen, f"{broker}: null case missing"
 
