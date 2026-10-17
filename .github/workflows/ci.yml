@@ -97,6 +97,19 @@ jobs:
               assert os.path.exists(path), f"{case['name']!r} references missing file {path}"
               return json.load(open(path))
 
+          ASCII_BLANK = " \t\n\v\f\r"  # the only whitespace that counts as blank (ADR-0031 (c)); U+2003/U+00A0 are not
+
+          def normalise(doc):
+              # Reference oracle for the decode-time `urn` rule (ADR-0031 (c)): a missing/empty/ASCII-blank
+              # `job` falls back to `urn`; top-level `urn` is never kept. The re-emit is checked against this.
+              out = dict(doc)
+              job = out.get("job")
+              blank = not isinstance(job, str) or all(c in ASCII_BLANK for c in job)
+              if blank and isinstance(out.get("urn"), str):
+                  out["job"] = out["urn"]
+              out.pop("urn", None)
+              return out
+
           total = 0
 
           for case in manifest["roundtrip"]["cases"]:
@@ -108,9 +121,12 @@ jobs:
               else:
                   assert not schema_valid(doc), f"roundtrip {case['name']!r} is flagged producer_schema_valid:false but passes the schema"
               assert case["expect_attempts"] == doc["attempts"] + 1, f"roundtrip {case['name']!r}: expect_attempts must be attempts+1"
+              reemit = normalise(doc)
               for pointer, value in case["expect_preserved"].items():
-                  found, actual = resolve(doc, pointer)
-                  assert found and same(actual, value), f"roundtrip {case['name']!r}: {pointer} not in fixture with that value"
+                  found, actual = resolve(reemit, pointer)
+                  assert found and same(actual, value), f"roundtrip {case['name']!r}: {pointer} not in the re-emitted fixture with that value"
+              for pointer in case.get("expect_absent_after_reencode", []):
+                  assert not resolve(reemit, pointer)[0], f"roundtrip {case['name']!r}: {pointer} must be absent after re-encode"
               total += 1
 
           for case in manifest["data_shape"]["cases"]:
@@ -134,6 +150,51 @@ jobs:
               assert schema_valid(doc), f"forbidden_keys {case['name']!r} must still pass the envelope schema"
               assert resolve(doc, case["forbidden_key"])[0], f"forbidden_keys {case['name']!r}: fixture lacks {case['forbidden_key']}"
               assert case["forbidden_key"] in case["expect_absent_after_reencode"]
+              reemit = normalise(doc)
+              for pointer, value in case.get("expect_preserved", {}).items():
+                  found, actual = resolve(reemit, pointer)
+                  assert found and same(actual, value), f"forbidden_keys {case['name']!r}: {pointer} not in the re-emitted fixture with that value"
+              if case["forbidden_key"] == "/urn":
+                  assert not resolve(reemit, "/urn")[0]
+              total += 1
+
+          CORE_META = {"id", "queue", "lang", "schema_version", "created_at"}  # ADR-0031 (b)
+          FORBIDDEN_META = {"max_retries", "attempts", "source", "ts"}  # message-envelope.md section 10
+
+          section = manifest["extension_write"]
+          for case in section["cases"]:
+              for key in ("name", "urn", "queue", "data", "meta", "expect_envelope"):
+                  assert key in case, f"extension_write {case.get('name')!r} missing '{key}'"
+              assert isinstance(case["data"], dict) and isinstance(case["meta"], dict) and case["meta"], f"extension_write {case['name']!r}: data and meta must be objects, meta non-empty"
+              assert not (set(case["meta"]) & (CORE_META | FORBIDDEN_META)), f"extension_write {case['name']!r}: meta uses a reserved key"
+              # reference model of the producer output: core keys + the meta entries
+              out = {
+                  "job": case["urn"], "data": case["data"], "attempts": 0,
+                  "meta": {"queue": case["queue"], "lang": "php", "schema_version": 1, **case["meta"]},
+              }
+              for pointer, value in case["expect_envelope"].items():
+                  found, actual = resolve(out, pointer)
+                  assert found and same(actual, value), f"extension_write {case['name']!r}: {pointer} not produced by the reference model"
+              total += 1
+
+          section = manifest["encode_reject"]
+          for case in section["cases"]:
+              for key in ("name", "urn", "queue", "data", "expect", "offending_key"):
+                  assert key in case, f"encode_reject {case.get('name')!r} missing '{key}'"
+              assert case["expect"] == "reject", f"encode_reject {case['name']!r}: expect must be 'reject'"
+              inputs = [k for k in ("meta", "meta_entries", "extras_top", "extras_meta") if k in case]
+              assert len(inputs) == 1, f"encode_reject {case['name']!r}: exactly one input field, got {inputs}"
+              if "meta_entries" in case:
+                  keys = [e[0] for e in case["meta_entries"]]
+                  assert len(keys) != len(set(keys)), f"encode_reject {case['name']!r}: meta_entries must repeat a key"
+                  rejected = True
+              elif "meta" in case:
+                  rejected = bool(set(case["meta"]) & (CORE_META | FORBIDDEN_META))
+              elif "extras_meta" in case:
+                  rejected = bool(set(case["extras_meta"]) & (CORE_META | FORBIDDEN_META))
+              else:
+                  rejected = bool(set(case["extras_top"]) & {"timestamp", "urn"})
+              assert rejected, f"encode_reject {case['name']!r}: input does not hit a rejected key set"
               total += 1
 
           section = manifest["payload_schema_unicode"]

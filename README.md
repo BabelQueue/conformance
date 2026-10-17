@@ -218,13 +218,19 @@ three-method `Store` interface (`seen` / `remember` / `forget`) backs a shared
 Redis/DB store for a fleet — the contract here is **store-agnostic**, it asserts the
 decision sequence, not a backend.
 
-## Behaviour conformance (`manifest.json` → `roundtrip`, `data_shape`, `forbidden_keys`, `payload_schema_unicode`)
+## Behaviour conformance (`manifest.json` → `roundtrip`, `data_shape`, `forbidden_keys`, `payload_schema_unicode`, `extension_write`, `encode_reject`)
 
-These four blocks lock **behaviour** every SDK core must share on top of the envelope
+These six blocks lock **behaviour** every SDK core must share on top of the envelope
 `cases` — what happens when a message is decoded and written back. A runner that does
 not know a block skips it (all existing runners look sections up by name), so adding a
 block never turns an old runner red. JSON pointers are **RFC 6901** (`/meta/vendor_flag`).
 "Same value" means JSON deep-equality **with type distinction**: `true` ≠ `1`, `{}` ≠ `[]`.
+
+**Unknown case fields are ignored.** A runner reads only the case fields it knows; an extra
+field (for example a field added by a later suite version) never fails the case and never
+makes the runner skip it. This is the field-level counterpart of the block-level rule above
+(a runner skips a block it does not know). A runner evaluates an optional field only when the
+case carries it; a case without the field behaves exactly as it did before the field existed.
 
 ### `roundtrip` — unknown keys survive re-emit
 
@@ -232,11 +238,13 @@ Contract basis: consumers MUST ignore unknown keys ([message-envelope.md](https:
 Ignoring must not mean **deleting**: retry, DLQ, redrive and outbox relay all decode and
 re-encode, so an SDK that drops unknown keys silently breaks forward compatibility (GR-5).
 
-Case shape: `{ "name", "file", "description", "expect_attempts", "expect_preserved": { "<pointer>": <value> }, "producer_schema_valid"? }`.
+Case shape: `{ "name", "file", "description", "expect_attempts", "expect_preserved": { "<pointer>": <value> }, "producer_schema_valid"?, "expect_absent_after_reencode"? }`.
 
 Runner: decode `file` (MUST be accepted) → `attempts + 1` → encode → parse the output and
 assert `attempts == expect_attempts` and every `expect_preserved` pointer holds the given
-value. Key order and whitespace are **not** asserted.
+value. Key order and whitespace are **not** asserted. If the case has
+`expect_absent_after_reencode` (1.4.0), none of its pointers may exist in that same
+re-encoded output.
 
 | Case | Expected behaviour |
 | :--- | :--- |
@@ -245,10 +253,14 @@ value. Key order and whitespace are **not** asserted.
 | `unknown-lang` | `meta.lang: "cobol"` decodes without error and is re-emitted as `"cobol"`. |
 | `empty-data-roundtrip` | `data: {}` comes back as an **object** `{}`, never `[]`. |
 | `wrong-case-keys-roundtrip` | A valid envelope that also carries `JOB`, `Data` and `meta.Queue`: the canonical `job` / `data` / `meta.queue` are unchanged and the three wrongly cased keys come back with their own values; `attempts` 0 → 1. |
+| `meta-ext-vendor-roundtrip` | (1.4.0) Vendor blocks under `meta.ext.<vendor>` (`acme`, `globex`) with nested objects and arrays come back unchanged ([ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md)); `attempts` 0 → 1. |
+| `urn-only-roundtrip` | (1.4.0) Only `urn`, no `job`: accepted, the URN is read from `urn`, the re-emit has `/job` = the URN and no `/urn`. No warning (the alias is the identity source). |
+| `blank-ascii-job-urn-fallback` | (1.4.0) `job` is two spaces, `urn` present: the blank `job` counts as absent, so the URN falls back to `urn`; re-emit has `/job` = the URN and no `/urn`. Blank means empty or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`). |
 
-`producer_schema_valid: false` (on `unknown-lang`) marks a **consumer-tolerance** fixture:
-like `urn-alias`, it intentionally fails the producer JSON Schema (`meta.lang` is an enum
-there) but a consumer MUST still accept and faithfully re-emit it.
+`producer_schema_valid: false` (on `unknown-lang` and `urn-only-roundtrip`) marks a
+**consumer-tolerance** fixture: like `urn-alias`, it intentionally fails the producer JSON
+Schema (`meta.lang` is an enum there; `job` is required) but a consumer MUST still accept and
+faithfully re-emit it.
 
 ### `data_shape` — `data` is always an object
 
@@ -273,11 +285,17 @@ producers keep working; encoding **never** emits the key. The forbidden key is t
 **not** captured into the unknown-key extras — otherwise "preserve unknown keys" and
 "never emit forbidden keys" would contradict each other.
 
-Case shape: `{ "name", "file", "forbidden_key": "<pointer>", "expect": "warn", "expect_absent_after_reencode": ["<pointer>", ...] }`.
+Case shape: `{ "name", "file", "forbidden_key": "<pointer>", "expect": "warn", "expect_absent_after_reencode": ["<pointer>", ...], "expect_preserved"? }`.
 
 Runner: decode `file` → MUST succeed **and** the SDK MUST surface at least one warning
 (its logger / warning hook) naming the key → re-encode the decoded message unchanged →
-none of `expect_absent_after_reencode` may exist in the output.
+none of `expect_absent_after_reencode` may exist in the output, and (1.4.0, optional) every
+`expect_preserved` pointer (`{ "<pointer>": <value> }`) holds the given value in that same
+re-encoded output.
+
+[ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md) (c)
+makes the decode warning a MUST and makes **encode reject** a forbidden key (see
+`encode_reject` below); decode itself stays lenient.
 
 | Case | Expected behaviour |
 | :--- | :--- |
@@ -286,6 +304,59 @@ none of `expect_absent_after_reencode` may exist in the output.
 | `forbidden-key-meta-attempts` | `meta.attempts` (draft shadow of top-level `attempts`) → decode warns; re-encoded envelope has no `/meta/attempts`; top-level `/attempts` is unaffected. |
 | `forbidden-key-meta-source` | `meta.source` → decode warns; re-encoded envelope has no `/meta/source`. |
 | `forbidden-key-meta-ts` | `meta.ts` → decode warns; re-encoded envelope has no `/meta/ts`. |
+| `forbidden-key-job-and-urn` | (1.4.0) Both `job` and top-level `urn` present: `job` wins, `urn` is dropped with a warning naming `/urn`; re-encoded envelope keeps `/job` and has no `/urn`. |
+| `forbidden-key-job-nonascii-space-and-urn` | (1.4.0) `job` is only U+2003 (not ASCII whitespace, so **not** blank): `job` wins, `urn` is dropped with a warning, **no** fallback to `urn`; re-encoded envelope keeps `/job` = U+2003 and has no `/urn`. |
+
+### `extension_write` — the producer `meta` write API (1.4.0)
+
+[ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md) (b):
+Go `WithMeta(key, value)`, Python `make(meta=)`, Node `MakeOptions.meta`, PHP `make(meta:)`,
+Java `make(urn, data, queue, traceId, Map meta)`, .NET `Make(meta:)`. There is no top-level
+write API.
+
+Case shape: `{ "name", "description", "urn", "queue", "data", "meta": { "<key>": <value> }, "expect_envelope": { "<pointer>": <value> } }`.
+
+Runner: build the message with the SDK's producer API from `urn`, `queue`, `data` and the
+`meta` entries (a vendor block is supplied as the whole `ext` value) → encode → parse the
+output → every `expect_envelope` pointer holds the given value → then decode that output,
+`attempts + 1`, encode and parse again and assert the same pointers plus `/attempts == 1`
+(extension keys survive a retry hop). Per-message fields (`meta.id`, `trace_id`,
+`meta.created_at`) are not asserted by value; key order and whitespace are not asserted.
+
+| Case | Expected behaviour |
+| :--- | :--- |
+| `flat-scalar-key` | A flat key (`vendor_flag: true`) sits in `meta` next to the core keys. |
+| `vendor-block-under-ext` | `meta.ext.acme` with nested object and array survives. |
+| `two-vendors-in-one-ext` | `meta.ext.acme` and `meta.ext.globex` both survive. |
+| `several-flat-keys-mixed-types` | String, integer, array and `{}` values keep name, value and type. |
+| `non-ascii-value` | A non-ASCII value round-trips byte-for-byte. |
+
+### `encode_reject` — encode refuses forbidden and colliding keys (1.4.0)
+
+[ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md) (b), (c):
+encode **rejects** (an `error` in Go, an exception elsewhere; never a silent drop) a forbidden
+key (also when it arrives through preserved extras), a collision with a core `meta` key (`id`,
+`queue`, `lang`, `schema_version`, `created_at`) and a repeated extension key.
+
+Case shape: `{ "name", "description", "urn", "queue", "data", "expect": "reject", "offending_key", <one input field> }` where the input is one of:
+
+- `meta` — entries passed through the producer `meta` write API;
+- `meta_entries` — the same as an ordered `[key, value]` list, for a **repeated** key a JSON
+  object cannot express (SDKs whose write API takes one map per call skip these cases);
+- `extras_top` / `extras_meta` — entries the runner places into the message's preserved
+  unknown-key container at top level / under `meta`, by whatever test access the SDK has,
+  standing for extras carried over from an inbound message (the write API has no top-level keys).
+
+Runner: build → encode MUST fail and produce no envelope JSON. `offending_key` is
+informational; a runner MAY assert the error mentions it.
+
+| Case | Rejected input |
+| :--- | :--- |
+| `reject-top-level-timestamp`, `reject-top-level-urn` | forbidden top-level key via `extras_top` |
+| `reject-meta-max-retries`, `-attempts`, `-source`, `-ts` | forbidden `meta` key via the write API |
+| `reject-forbidden-meta-key-in-extras` | forbidden `meta` key via `extras_meta` |
+| `reject-core-meta-id`, `-queue`, `-lang`, `-schema-version`, `-created-at` | core `meta` key collision |
+| `reject-repeated-key` | `ext` supplied twice (`meta_entries`) |
 
 ### `payload_schema_unicode` — string length is code points
 
@@ -332,6 +403,14 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 
 ## Suite version history
 
+- **1.4.0** — [ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md).
+  Adds the blocks `extension_write` and `encode_reject`; the `forbidden_keys` cases
+  `forbidden-key-job-and-urn` and `forbidden-key-job-nonascii-space-and-urn`; the `roundtrip`
+  cases `meta-ext-vendor-roundtrip`, `urn-only-roundtrip` and `blank-ascii-job-urn-fallback`;
+  and the optional case fields `expect_preserved` (on `forbidden_keys`) and
+  `expect_absent_after_reencode` (on `roundtrip`). Additive: no existing case, fixture or
+  schema changed, and a case without the new fields behaves as before. Vendored copies may
+  be red on the new cases until each SDK implements ADR-0031.
 - **1.3.0** — adds the `cases` entries `invalid-wrong-case-job` (a `JOB` key is not `job`: the
   message has no identity) and `duplicate-keys-last-wins` (repeated `job` / `data` keys: last
   wins, never merged), and the `roundtrip` case `wrong-case-keys-roundtrip` (wrongly cased
