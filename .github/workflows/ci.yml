@@ -125,6 +125,30 @@ jobs:
               for pointer, value in case["expect_preserved"].items():
                   found, actual = resolve(reemit, pointer)
                   assert found and same(actual, value), f"roundtrip {case['name']!r}: {pointer} not in the re-emitted fixture with that value"
+              # No roundtrip fixture may carry a forbidden key or both a non-blank job and a urn: the
+              # manifest tells runners that decoding emits no warning.
+              meta = doc.get("meta", {})
+              assert not ({"timestamp"} & set(doc)) and not ({"max_retries", "attempts", "source", "ts"} & set(meta)), \
+                  f"roundtrip {case['name']!r}: fixture carries a forbidden key, decode would warn"
+              assert not ("urn" in doc and not all(c in ASCII_BLANK for c in str(doc.get("job", "")))), \
+                  f"roundtrip {case['name']!r}: fixture carries both a non-blank job and urn, decode would warn"
+              if "apply_dead_letter" in case:
+                  applied = case["apply_dead_letter"]
+                  assert set(applied) == {"reason", "original_queue"}, f"roundtrip {case['name']!r}: apply_dead_letter needs exactly reason + original_queue"
+                  assert applied["reason"] in ("failed", "unknown_urn", "poison"), f"roundtrip {case['name']!r}: bad dead_letter reason"
+                  assert isinstance(applied["original_queue"], str) and applied["original_queue"], f"roundtrip {case['name']!r}: bad original_queue"
+                  assert "dead_letter" not in doc, f"roundtrip {case['name']!r}: fixture must not already carry a dead_letter block"
+                  assert isinstance(case.get("expect_dead_letter"), dict) and case["expect_dead_letter"], f"roundtrip {case['name']!r}: apply_dead_letter needs expect_dead_letter"
+                  # Reference DLQ move: the original envelope verbatim plus the dead_letter block (error-handling.md section 6).
+                  dlq = dict(reemit)
+                  dlq["dead_letter"] = {"reason": applied["reason"], "original_queue": applied["original_queue"]}
+                  for pointer, value in case["expect_preserved"].items():
+                      found, actual = resolve(dlq, pointer)
+                      assert found and same(actual, value), f"roundtrip {case['name']!r}: {pointer} not in the dead-letter copy with that value"
+                  for field, value in case["expect_dead_letter"].items():
+                      assert field in dlq["dead_letter"] and same(dlq["dead_letter"][field], value), f"roundtrip {case['name']!r}: dead_letter.{field} mismatch"
+              else:
+                  assert "expect_dead_letter" not in case, f"roundtrip {case['name']!r}: expect_dead_letter without apply_dead_letter"
               for pointer in case.get("expect_absent_after_reencode", []):
                   assert not resolve(reemit, pointer)[0], f"roundtrip {case['name']!r}: {pointer} must be absent after re-encode"
               total += 1

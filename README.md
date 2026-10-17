@@ -238,13 +238,30 @@ Contract basis: consumers MUST ignore unknown keys ([message-envelope.md](https:
 Ignoring must not mean **deleting**: retry, DLQ, redrive and outbox relay all decode and
 re-encode, so an SDK that drops unknown keys silently breaks forward compatibility (GR-5).
 
-Case shape: `{ "name", "file", "description", "expect_attempts", "expect_preserved": { "<pointer>": <value> }, "producer_schema_valid"?, "expect_absent_after_reencode"? }`.
+Case shape: `{ "name", "file", "description", "expect_attempts", "expect_preserved": { "<pointer>": <value> }, "producer_schema_valid"?, "expect_absent_after_reencode"?, "apply_dead_letter"?, "expect_dead_letter"? }`.
 
 Runner: decode `file` (MUST be accepted) → `attempts + 1` → encode → parse the output and
 assert `attempts == expect_attempts` and every `expect_preserved` pointer holds the given
-value. Key order and whitespace are **not** asserted. If the case has
-`expect_absent_after_reencode` (1.4.0), none of its pointers may exist in that same
-re-encoded output.
+value. Key order and whitespace are **not** asserted. Decoding a `roundtrip` fixture MUST
+NOT emit any warning (none of these fixtures carries a forbidden key; when `job` is missing
+or blank, `urn` is the source of the identity, not a dropped key) — the runner asserts the
+SDK's warning hook stayed silent. If the case has `expect_absent_after_reencode` (1.4.0),
+none of its pointers may exist in that same re-encoded output.
+
+**`apply_dead_letter` / `expect_dead_letter` (1.4.0, optional).** A dead-letter move is a
+re-emit too (message-envelope.md §8 rule 7), so it must keep unknown keys. When a case carries
+`apply_dead_letter: { "reason", "original_queue" }`, the runner, after the `attempts + 1` step,
+moves the decoded message to the dead-letter queue with **the SDK's own DLQ helper** (the code
+path its worker uses on retry exhaustion — in Java this includes each of the four adapters'
+DLQ paths), with `reason` one of `failed` / `unknown_urn` / `poison`, and parses the
+**dead-letter copy** instead of the plain re-encode. Every assertion of the case
+(`expect_attempts`, `expect_preserved`, `expect_absent_after_reencode`) is then evaluated on that
+copy. `expect_dead_letter` is a map `{ "<dead_letter sub-field>": <value> }`: the copy MUST carry
+a `dead_letter` object (message-envelope.md §10b) and each listed sub-field MUST deep-equal the
+value. Anything else the helper needs or writes (`error`, `exception`, `failed_at`, `attempts`,
+`lang`) is runner-chosen or SDK-determined and is **not** asserted. A runner that does not know
+these fields ignores them and runs the case as a plain roundtrip, which the case also passes —
+so an old runner stays green but does not cover the DLQ path until it is wired.
 
 | Case | Expected behaviour |
 | :--- | :--- |
@@ -253,7 +270,8 @@ re-encoded output.
 | `unknown-lang` | `meta.lang: "cobol"` decodes without error and is re-emitted as `"cobol"`. |
 | `empty-data-roundtrip` | `data: {}` comes back as an **object** `{}`, never `[]`. |
 | `wrong-case-keys-roundtrip` | A valid envelope that also carries `JOB`, `Data` and `meta.Queue`: the canonical `job` / `data` / `meta.queue` are unchanged and the three wrongly cased keys come back with their own values; `attempts` 0 → 1. |
-| `meta-ext-vendor-roundtrip` | (1.4.0) Vendor blocks under `meta.ext.<vendor>` (`acme`, `globex`) with nested objects and arrays come back unchanged ([ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md)); `attempts` 0 → 1. |
+| `meta-ext-vendor-roundtrip` | (1.4.0) Vendor blocks under `meta.ext.<vendor>` (`acme`, `globex`) with nested objects and arrays come back unchanged (ADR-0031); `attempts` 0 → 1. |
+| `dead-letter-roundtrip` | (1.4.0) Moved to the DLQ with `apply_dead_letter` (`reason: failed`, `original_queue: orders`): `meta.vendor_flag`, `meta.ext.acme`, top-level `extra_top`, `trace_id`, `meta.id` and `data` come back unchanged, and `dead_letter.reason` / `dead_letter.original_queue` carry the requested values; `attempts` 2 → 3. |
 | `urn-only-roundtrip` | (1.4.0) Only `urn`, no `job`: accepted, the URN is read from `urn`, the re-emit has `/job` = the URN and no `/urn`. No warning (the alias is the identity source). |
 | `blank-ascii-job-urn-fallback` | (1.4.0) `job` is two spaces, `urn` present: the blank `job` counts as absent, so the URN falls back to `urn`; re-emit has `/job` = the URN and no `/urn`. Blank means empty or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`). |
 
@@ -293,7 +311,7 @@ none of `expect_absent_after_reencode` may exist in the output, and (1.4.0, opti
 `expect_preserved` pointer (`{ "<pointer>": <value> }`) holds the given value in that same
 re-encoded output.
 
-[ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md) (c)
+ADR-0031 (c)
 makes the decode warning a MUST and makes **encode reject** a forbidden key (see
 `encode_reject` below); decode itself stays lenient.
 
@@ -309,7 +327,7 @@ makes the decode warning a MUST and makes **encode reject** a forbidden key (see
 
 ### `extension_write` — the producer `meta` write API (1.4.0)
 
-[ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md) (b):
+ADR-0031 (b):
 Go `WithMeta(key, value)`, Python `make(meta=)`, Node `MakeOptions.meta`, PHP `make(meta:)`,
 Java `make(urn, data, queue, traceId, Map meta)`, .NET `Make(meta:)`. There is no top-level
 write API.
@@ -329,11 +347,11 @@ output → every `expect_envelope` pointer holds the given value → then decode
 | `vendor-block-under-ext` | `meta.ext.acme` with nested object and array survives. |
 | `two-vendors-in-one-ext` | `meta.ext.acme` and `meta.ext.globex` both survive. |
 | `several-flat-keys-mixed-types` | String, integer, array and `{}` values keep name, value and type. |
-| `non-ascii-value` | A non-ASCII value round-trips byte-for-byte. |
+| `non-ascii-value` | A non-ASCII value is value-equal after parse (the runner compares parsed values, so `\uXXXX` escaping in the output is accepted). |
 
 ### `encode_reject` — encode refuses forbidden and colliding keys (1.4.0)
 
-[ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md) (b), (c):
+ADR-0031 (b), (c):
 encode **rejects** (an `error` in Go, an exception elsewhere; never a silent drop) a forbidden
 key (also when it arrives through preserved extras), a collision with a core `meta` key (`id`,
 `queue`, `lang`, `schema_version`, `created_at`) and a repeated extension key.
@@ -403,12 +421,13 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 
 ## Suite version history
 
-- **1.4.0** — [ADR-0031](../.ssot/architecture/adr/0031-unknown-key-preservation-extension-write-api.md).
+- **1.4.0** — ADR-0031.
   Adds the blocks `extension_write` and `encode_reject`; the `forbidden_keys` cases
   `forbidden-key-job-and-urn` and `forbidden-key-job-nonascii-space-and-urn`; the `roundtrip`
   cases `meta-ext-vendor-roundtrip`, `urn-only-roundtrip` and `blank-ascii-job-urn-fallback`;
-  and the optional case fields `expect_preserved` (on `forbidden_keys`) and
-  `expect_absent_after_reencode` (on `roundtrip`). Additive: no existing case, fixture or
+  the `roundtrip` case `dead-letter-roundtrip` (a DLQ move keeps unknown keys); and the
+  optional case fields `expect_preserved` (on `forbidden_keys`),
+  `expect_absent_after_reencode`, `apply_dead_letter` and `expect_dead_letter` (on `roundtrip`). Additive: no existing case, fixture or
   schema changed, and a case without the new fields behaves as before. Vendored copies may
   be red on the new cases until each SDK implements ADR-0031.
 - **1.3.0** — adds the `cases` entries `invalid-wrong-case-job` (a `JOB` key is not `job`: the
