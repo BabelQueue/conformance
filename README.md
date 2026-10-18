@@ -13,7 +13,10 @@ a message one produces is consumable by the other.
 | :--- | :--- |
 | `schema/message-envelope.schema.json` | The canonical envelope JSON Schema (draft-07). Validates **producer** output (`job` required). |
 | `fixtures/*.json` | Canonical envelopes — one per case (pure envelopes, schema-validatable). |
-| `manifest.json` | The case list: each case's fixture file, whether it's `valid`, and the `expect` values a consumer must derive. Drives a generic runner in any language. |
+| `manifest.json` | The case list: each case's fixture file, whether it's `valid`, and the `expect` values a consumer must derive. Drives a generic runner in any language. Since 1.5.0 it also carries a top-level `conformance_version`, the `sections` scope map and the `exceptions` list. |
+| `schema/results.schema.json` | JSON Schema (draft 2020-12) of the **results file** an SDK's conformance run emits ([ADR-0032](https://babelqueue.com)). See [Results format](#results-format-adr-0032). |
+| `schema/results.example.json` | A valid example results file (checked against the schema in CI). |
+| `fetch.sh` | Downloads a released suite, verifies its checksum, and either unpacks it or checks a vendored copy against it. See [Release asset and `fetch.sh`](#release-asset-and-fetchsh). |
 | `CONFORMANCE_VERSION` | The suite's SemVer (K-14). Vendored next to `manifest.json` so every SDK records which revision it runs; the canonical repo is tagged `v<version>`. `-pre` = not yet tagged. |
 
 ## What an SDK must do (per `manifest.json` case)
@@ -85,8 +88,8 @@ ASB transport must satisfy it:
 
 The five ASB SDKs (`babelqueue-dotnet-azureservicebus`, `babelqueue-java-azureservicebus`,
 `@babelqueue/azure-service-bus`, `babelqueue` Python `AsbTransport`,
-`babelqueue-go/azureservicebus`) vendor this manifest via `sync.sh`; their conformance
-runners are wired next. SDKs without an ASB transport ignore this block.
+`babelqueue-go/azureservicebus`) vendor this manifest via `sync.sh` and run this block from
+the vendored copy. SDKs without an ASB transport ignore this block.
 
 The `pulsar` block locks the **Apache Pulsar binding**
 ([broker-bindings.md §5](https://babelqueue.com)) the same way. Every SDK that ships a
@@ -109,7 +112,7 @@ Pulsar transport must satisfy it:
 
 The five Pulsar SDKs (`babelqueue-dotnet-pulsar`, `babelqueue-java-pulsar`,
 `@babelqueue/pulsar`, `babelqueue` Python `PulsarTransport`, `babelqueue-go/pulsar`) vendor
-this manifest via `sync.sh`; their conformance runners are wired next. SDKs without a
+this manifest via `sync.sh` and run this block from the vendored copy. SDKs without a
 Pulsar transport ignore this block.
 
 The `kafka` block locks the **Apache Kafka binding**
@@ -132,7 +135,7 @@ transport must satisfy it:
 
 The five Kafka SDKs (`babelqueue-dotnet-kafka`, `babelqueue-java-kafka`, `@babelqueue/kafka`,
 `babelqueue` Python `KafkaTransport`, `babelqueue-go/kafka`) vendor this manifest via
-`sync.sh`; their conformance runners are wired next. SDKs without a Kafka transport ignore
+`sync.sh` and run this block from the vendored copy. SDKs without a Kafka transport ignore
 this block.
 
 ### `schema_version_gate` — version-gate before decoding (`sqs`, `asb`, `kafka`, `artemis`, `pulsar`)
@@ -394,6 +397,95 @@ units (Java/.NET/JS `length`), not grapheme clusters (.NET `StringInfo`).
 `maxLength` is deliberately **not** covered: no SDK supports it yet. It arrives with the
 Draft-07 keyword subset in R1 (**K-17**), together with its own cases.
 
+## Sections, scopes and exceptions (1.5.0, ADR-0032)
+
+Every block of `manifest.json` is a **section**. The top-level `sections` map assigns each
+section exactly one **scope** — `core`, a binding it exercises (`redis`, `amqp`, `sqs`,
+`asb`, `pulsar`, `kafka`, `artemis`; the `rabbitmq` section's scope is `amqp`), or `otel`.
+`otel` is not a broker: it is the optional W3C `traceparent` extract/inject code of ADR-0028
+(in the core of Node and .NET; a separate module for Go, Python, Java and PHP), so only a
+package that carries it runs the `otel` sections. A runner enumerates sections from this map
+rather than from a hard-coded list, runs the sections whose scope the package carries, and
+**tolerates a section newer than the suite version it implements** (it does not crash on it).
+That tolerance is not a pass: for the version it pins, every in-scope section MUST be run and
+reported, and an unimplemented in-scope section means the package is not Compatible (`skip`
+is never a way to leave a section out — see below). A section whose scope the package does not
+carry is simply absent from its results; the required sections are all `core` sections plus
+the sections of every binding in `bindings`.
+
+The top-level `exceptions` list records deliberate, ADR-backed, family-level non-support, e.g.
+`{"family": "php", "binding": "asb", "adr": "ADR-0021"}` (PHP has no conformant Azure Service
+Bus path). A binding under an exception is **not** listed in `bindings` and its sections are
+**absent** from `results.json`; it is not a `skip`. A `skip` is only for an individual case of
+an in-scope section and always cites an ADR.
+
+A deviation from the wire contract is never a reason to skip: for example a Redis transport
+that does not use the §1.1 key layout fails `redis_layout` and the SDK is fixed. Details the
+contract leaves open (the Redis available-at formula and delayed/reserved sweep, the Kafka
+tier numbering) are not pinned by any section; the Redis ones are left to the R1 Redis plan.
+
+Six sections were added in 1.5.0. Each is kept to what the wire contract actually pins; where
+the contract is silent the section says so in its `description` and tests nothing.
+
+| Section | Scope | Pins |
+| :--- | :--- | :--- |
+| `trim` | `core` | ADR-0032 §5: the ASCII whitespace set (space, `\t`, `\n`, `\r`, `\f`, `\v`) is trimmed from the `make` input (URN, `trace_id`); U+00A0, U+2003 and U+3000 are *not* whitespace and stay in the value; blank `job` / `urn` / `trace_id` on decode and `accepts`; re-emit never trims (a non-blank `job` and `trace_id` survive byte-for-byte, GR-4). |
+| `job_type` | `core` | ADR-0032 §6: a non-string `job` (null, number, boolean, object, array) is ignored and decode MUST warn; a blank-string `job` falls back to `urn` without a warning; a non-string `urn` is ignored; with no valid identity decode raises. |
+| `delay` | `sqs` | broker-bindings §3.4–3.5: `DelaySeconds` on standard queues, the 900 s cap and FIFO per-message delay raising `BabelQueueException`, and the `ChangeMessageVisibility` timeout of a release. |
+| `backoff` | `kafka` | broker-bindings §6.3–6.5: retry-tier selection (smallest tier ≥ the requested delay, `bq-delay` / `bq-original-topic` headers), reject above the largest tier, and the retry republish (`bq-attempts + 1`, `bq-delay`, `bq-original-topic`, body `attempts` in sync). |
+| `traceparent` | `otel` | ADR-0028 / ADR-0025: consumer-side extraction of the W3C `traceparent` header (valid header wins, malformed or absent header falls back to the `trace_id`-derived hex, never raises). Only the `00-<32hex>-<16hex>-<2hex>` structure is pinned; the finer W3C rules and the out-of-band carriage on a real transport are left to the R1 OTel plan. |
+| `redis_layout` | `redis` | broker-bindings §1.1: the key names of the Laravel-compatible layout (`queues:<q>`, `:delayed`, `:reserved`, `:notify`). Names only — no available-at formula or sweep is pinned. |
+
+The `trim` cases pin the ASCII-trim rule of `make` only. Some of them feed `make` a Unicode-space
+or space-padded URN; that fixes what the blank check does with it, not that such strings are
+well-formed URNs. The contract defines no rejection of them today, so the expectation stands:
+`make` must accept them and not fail the blank check. Should URN grammar validation
+(urn-naming §2, lowercase ASCII) ever be added to `make`, these cases would be updated in a new
+suite version together with an ADR; until then an SDK that rejects them fails the case.
+
+Case ids used by a runner (and by the results file) follow one rule: a section's `cases`
+array yields the case's `name`, or `<section>#<0-based index>` when it has none; a sub-key that
+has its own `cases` array yields `<sub-key>/<name>` (`<sub-key>/<0-based index>` when
+unnamed); any other object sub-key is a single case keyed by the sub-key; `description` and
+`schema` are not cases; the top-level `cases` array is the section named `cases`.
+
+## Results format (ADR-0032)
+
+A conformance run emits one `results.json`, validated by `schema/results.schema.json` (see
+`schema/results.example.json`): `sdk`, `version`, `conformance_version`, `generated_at`
+(RFC 3339; UTC recommended), `bindings` and `sections` — section → case id → `{"status": "pass" | "fail" | "skip",
+"reason"?}`. `bindings` is **every transport/binding the package carries**, derived from its
+modules (`otel` when it carries the traceparent code), and it **MUST be complete**: leaving a
+carried binding out is not a way to narrow the scope. A real file lists every case of every
+in-scope section; `schema/results.example.json` is abbreviated. A `skip` is only for an
+individual case of an in-scope section and MUST carry a `reason` that cites the ADR which makes
+the case not applicable (`ADR-NNNN`). The schema only checks the *shape*; that the ids match
+the manifest is checked by the consumer of the results.
+
+## Release asset and `fetch.sh`
+
+A `v<version>` tag publishes a GitHub release with two assets: the deterministic
+`babelqueue-conformance-<version>.tar.gz` (root directory `babelqueue-conformance-<version>/`
+holding `CONFORMANCE_VERSION`, `manifest.json`, `schema/`, `fixtures/` and `LICENSE`) and its
+`SHA256SUMS`. The tarball is reproducible (sorted entries, fixed mtime, owner 0, `gzip -n`), so
+two builds of the same tree have the same sha256.
+
+```bash
+./fetch.sh 1.5.0 /tmp/conformance            # download, verify, unpack (dest must be empty)
+./fetch.sh --check 1.5.0 tests/conformance   # exit 1 if the vendored copy differs
+```
+
+`fetch.sh` needs only `curl`, `tar` and `sha256sum` (or `shasum -a 256`). It refuses an asset
+whose checksum does not match, or whose entries escape the single root directory; `--check`
+compares with `diff -r`, ignoring `LICENSE` (which is not vendored). It also rejects an asset
+that contains a symlink, hardlink or special file. The checksum gives **integrity, not
+authenticity**: `SHA256SUMS` is published beside the asset, so it detects corruption, not a
+release whose asset and `SHA256SUMS` were both replaced; a consumer that needs authenticity
+pins the expected hash (or the exact tag) itself. Set
+`BQ_CONFORMANCE_BASE_URL` to read the assets from another location (a `file://` URL or a local
+mirror) instead of the GitHub release; the default is
+`https://github.com/BabelQueue/conformance/releases/download/v<version>`.
+
 ## Running it in an SDK
 
 Each SDK ships a conformance test that loads `manifest.json` + `fixtures/` from its
@@ -420,6 +512,15 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 `babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
 
 ## Suite version history
+
+- **1.5.0** — ADR-0032.
+  Adds the sections `trim`, `job_type` (scope `core`), `traceparent` (`otel`), `delay` (`sqs`),
+  `backoff` (`kafka`) and `redis_layout` (`redis`); the top-level `conformance_version`,
+  `sections` (section → scope) and `exceptions` keys of `manifest.json`; the results format
+  (`schema/results.schema.json`, `schema/results.example.json`); and the release asset
+  (`babelqueue-conformance-<version>.tar.gz` + `SHA256SUMS`) with `fetch.sh`. Additive: no
+  existing case, fixture or schema changed, and a runner may ignore a section newer than the version it pins.
+  Vendored copies may be red on the new cases until each SDK implements ADR-0032.
 
 - **1.4.0** — ADR-0031.
   Adds the blocks `extension_write` and `encode_reject`; the `forbidden_keys` cases

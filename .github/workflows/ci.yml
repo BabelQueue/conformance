@@ -4,6 +4,7 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  workflow_call:  # release.yml re-runs these checks before it publishes
 
 permissions:
   contents: read
@@ -329,6 +330,334 @@ jobs:
 
           print(f"✓ schema_version_gate tables well-formed — {len(BROKERS)} brokers, {total} cases")
           PY
+
+      - name: Manifest sections map, exceptions and version are consistent
+        run: |
+          python3 - <<'PY'
+          import json, re
+
+          manifest = json.load(open("manifest.json"))
+          version = open("CONFORMANCE_VERSION").read().strip()
+          assert manifest.get("conformance_version") == version, \
+              f"manifest.conformance_version {manifest.get('conformance_version')!r} != CONFORMANCE_VERSION {version!r}"
+
+          META_KEYS = {"schema_version", "description", "conformance_version", "sections", "exceptions"}
+          SCOPES = {"core", "redis", "amqp", "sqs", "asb", "pulsar", "kafka", "artemis", "otel"}
+          BINDINGS = SCOPES - {"core"}
+
+          sections = manifest["sections"]
+          declared = {k for k in manifest if k not in META_KEYS}
+          assert set(sections) == declared, \
+              f"sections map and manifest sections differ: only in map {sorted(set(sections) - declared)}, only in manifest {sorted(declared - set(sections))}"
+          for name, entry in sections.items():
+              assert set(entry) == {"scope"} and entry["scope"] in SCOPES, f"sections.{name}: needs exactly a valid 'scope', got {entry!r}"
+          assert sections["rabbitmq"]["scope"] == "amqp", "the rabbitmq section's scope is amqp"
+          for name in ("trim", "job_type"):
+              assert sections[name]["scope"] == "core", f"sections.{name}: expected scope core"
+          assert sections["traceparent"]["scope"] == "otel", "sections.traceparent: expected scope otel (ADR-0032 section 2)"
+
+          exceptions = manifest["exceptions"]
+          assert isinstance(exceptions, list), "exceptions must be a list"
+          for exc in exceptions:
+              assert set(exc) == {"family", "binding", "adr"}, f"exception needs family, binding, adr: {exc!r}"
+              assert isinstance(exc["family"], str) and exc["family"], f"exception family: {exc!r}"
+              assert exc["binding"] in BINDINGS, f"exception binding: {exc!r}"
+              assert re.fullmatch(r"ADR-[0-9]{4}", exc["adr"]), f"exception adr: {exc!r}"
+          assert {"family": "php", "binding": "asb", "adr": "ADR-0021"} in exceptions, "PHP x ASB (ADR-0021) exception missing"
+
+          print(f"✓ conformance_version {version}, sections map covers {len(sections)} sections, {len(exceptions)} exception(s)")
+          PY
+
+      - name: v1.5 sections agree with their reference oracles
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+
+          manifest = json.load(open("manifest.json"))
+          ASCII_BLANK = " \t\n\v\f\r"
+
+          def is_blank(value):
+              return all(c in ASCII_BLANK for c in value)
+
+          def resolve(doc, pointer):
+              node = doc
+              for raw in pointer.split("/")[1:]:
+                  key = raw.replace("~1", "/").replace("~0", "~")
+                  if isinstance(node, dict) and key in node:
+                      node = node[key]
+                  else:
+                      return False, None
+              return True, node
+
+          def same(a, b):
+              return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+          def names_unique(section, cases):
+              names = [c["name"] for c in cases]
+              assert len(names) == len(set(names)), f"{section}: duplicate case names"
+
+          def load(case, section):
+              assert os.path.exists(case["file"]), f"{section} {case['name']!r}: missing file {case['file']}"
+              return json.load(open(case["file"]))
+
+          def decode(doc):
+              # Reference oracle for ADR-0032 section 6 (+ ADR-0031): returns (urn or None, warns)
+              job, urn = doc.get("job"), doc.get("urn")
+              warns = "job" in doc and not isinstance(job, str)
+              if isinstance(job, str) and not is_blank(job):
+                  assert "urn" not in doc, "fixture carries both a non-blank job and a urn (ADR-0031 warn case belongs to roundtrip)"
+                  return job, warns
+              if isinstance(urn, str) and not is_blank(urn):
+                  return urn, warns
+              return None, warns
+
+          used = set()
+          total = 0
+
+          def check_decode(section, case):
+              doc = load(case, section)
+              used.add(case["file"])
+              urn, warns = decode(doc)
+              assert case["valid"] == (urn is not None), f"{section} {case['name']!r}: valid flag disagrees with the ADR-0032 oracle"
+              if case["valid"]:
+                  assert case["expect"] == {"urn": urn}, f"{section} {case['name']!r}: expect.urn disagrees with the oracle ({urn!r})"
+                  assert case["expect_warning"] is warns, f"{section} {case['name']!r}: expect_warning disagrees with the oracle ({warns})"
+              else:
+                  assert "reason" in case and "expect" not in case, f"{section} {case['name']!r}: an invalid case needs a reason and no expect"
+
+          # ---- trim -------------------------------------------------------------------
+          trim = manifest["trim"]["cases"]
+          names_unique("trim", trim)
+          modes = set()
+          for case in trim:
+              mode = case["mode"]
+              modes.add(mode)
+              if mode == "make":
+                  stripped = case["urn"].strip(ASCII_BLANK)
+                  if case["expect"] == "reject":
+                      assert stripped == "", f"trim {case['name']!r}: only an empty-after-trim URN is rejected"
+                  else:
+                      assert set(case["expect"]) <= {"job", "trace_id"}, f"trim {case['name']!r}: bad expect"
+                      assert case["expect"]["job"] == stripped, f"trim {case['name']!r}: job must be the ASCII-trimmed urn"
+                      if "trace_id" in case:
+                          assert case["expect"].get("trace_id") == case["trace_id"].strip(ASCII_BLANK), f"trim {case['name']!r}: trace_id must be ASCII-trimmed"
+              elif mode == "decode":
+                  check_decode("trim", case)
+              elif mode == "accepts":
+                  doc = load(case, "trim")
+                  used.add(case["file"])
+                  tid = doc.get("trace_id")
+                  assert case["expect_accepts"] is (isinstance(tid, str) and not is_blank(tid)), f"trim {case['name']!r}: expect_accepts disagrees with the blank rule"
+                  assert case["expect_decode_ok"] is True and decode(doc)[0] is not None, f"trim {case['name']!r}: a blank trace_id must not make decode fail"
+              elif mode == "reemit":
+                  doc = load(case, "trim")
+                  used.add(case["file"])
+                  assert case["expect_attempts"] == doc["attempts"] + 1, f"trim {case['name']!r}: expect_attempts must be attempts+1"
+                  assert case["expect_preserved"], f"trim {case['name']!r}: nothing preserved"
+                  for pointer, value in case["expect_preserved"].items():
+                      found, actual = resolve(doc, pointer)
+                      assert found and same(actual, value), f"trim {case['name']!r}: {pointer} is not in the fixture with that value"
+                  job = doc["job"]
+                  assert not is_blank(job), f"trim {case['name']!r}: a re-emit fixture needs a non-blank job"
+              else:
+                  raise AssertionError(f"trim {case['name']!r}: unknown mode {mode!r}")
+              total += 1
+          assert modes == {"make", "decode", "accepts", "reemit"}, f"trim must exercise every mode, got {sorted(modes)}"
+
+          # every ASCII-set member and every Unicode counter-example is covered
+          text = json.dumps(trim)
+          for escape in ("\\t", "\\n", "\\r", "\\f", "\\u000b", "\\u00a0", "\\u2003", "\\u3000"):
+              assert escape in text, f"trim never uses {escape}"
+
+          # ---- job_type ---------------------------------------------------------------
+          job_type = manifest["job_type"]["cases"]
+          names_unique("job_type", job_type)
+          kinds = set()
+          for case in job_type:
+              check_decode("job_type", case)
+              doc = json.load(open(case["file"]))
+              if "job" in doc and not isinstance(doc["job"], str):
+                  kinds.add(type(doc["job"]).__name__)
+                  if case["valid"]:
+                      assert case["expect_warning"] is True, f"job_type {case['name']!r}: a non-string job MUST warn"
+              total += 1
+          assert kinds >= {"NoneType", "int", "bool", "dict", "list"}, f"job_type must cover null/number/bool/object/array, got {sorted(kinds)}"
+
+          for fx in sorted(os.listdir("fixtures")):
+              if fx.startswith(("trim-", "job-type-")):
+                  assert f"fixtures/{fx}" in used, f"orphan fixture {fx}: not referenced by trim or job_type"
+
+          # ---- delay (sqs section 3.4 / 3.5) -------------------------------------------
+          delay = manifest["delay"]
+          names_unique("delay", delay["cases"])
+          for case in delay["cases"]:
+              d = case["delay_seconds"]
+              if case["queue_type"] == "fifo" or d > 900:
+                  assert case["expect"] == "reject", f"delay {case['name']!r}: >900 s and FIFO per-message delay must reject"
+              else:
+                  assert case["expect"] == {"delay_seconds_attribute": d} and 0 < d <= 900, f"delay {case['name']!r}: DelaySeconds must equal the delay"
+              total += 1
+          assert {c["delay_seconds"] for c in delay["cases"] if c["queue_type"] == "standard"} >= {900, 901}, "delay must lock the 900/901 boundary"
+          names_unique("delay.release_visibility", delay["release_visibility"]["cases"])
+          for case in delay["release_visibility"]["cases"]:
+              assert case["expect"] == {"visibility_timeout": case["delay_seconds"]} and 0 <= case["delay_seconds"] <= 43200, f"delay release {case['name']!r}"
+              total += 1
+
+          # ---- backoff (kafka section 6.4 / 6.5) ----------------------------------------
+          backoff = manifest["backoff"]
+
+          def tier_for(tiers, ms):
+              fit = [t for t in sorted(tiers) if t >= ms]
+              return fit[0] if fit else None
+
+          names_unique("backoff", backoff["cases"])
+          for case in backoff["cases"]:
+              tiers = case["retry_tiers_ms"]
+              assert tiers == sorted(tiers) and len(set(tiers)) == len(tiers), f"backoff {case['name']!r}: tiers must ascend"
+              tier = tier_for(tiers, case["delay_ms"])
+              if tier is None:
+                  assert case["expect"] == "reject", f"backoff {case['name']!r}: no tier fits, must reject"
+              else:
+                  assert case["expect"] == {"tier_ms": tier, "headers": {"bq-delay": str(case["delay_ms"]), "bq-original-topic": case["work_topic"]}}, f"backoff {case['name']!r}: tier/headers disagree with section 6.4"
+              total += 1
+          names_unique("backoff.retry_republish", backoff["retry_republish"]["cases"])
+          for case in backoff["retry_republish"]["cases"]:
+              tier = tier_for(case["retry_tiers_ms"], case["release_delay_ms"])
+              if tier is None:
+                  assert case["expect"] == "reject", f"retry_republish {case['name']!r}: must reject"
+              else:
+                  want = {"tier_ms": tier, "body_attempts": case["attempts"] + 1,
+                          "headers": {"bq-attempts": str(case["attempts"] + 1), "bq-delay": str(case["release_delay_ms"]),
+                                      "bq-original-topic": case["work_topic"]}}
+                  assert case["expect"] == want, f"retry_republish {case['name']!r}: disagrees with section 6.5"
+              total += 1
+
+          # ---- traceparent (ADR-0028 / ADR-0025) ---------------------------------------
+          TP = re.compile(r"^00-([0-9a-fA-F]{32})-([0-9a-fA-F]{16})-([0-9a-fA-F]{2})$")
+          traceparent = manifest["traceparent"]
+          names_unique("traceparent", traceparent["cases"])
+          for case in traceparent["cases"]:
+              assert case["mode"] == "extract"
+              header = case["traceparent"]
+              m = TP.match(header) if isinstance(header, str) else None
+              if m:
+                  want = {"source": "traceparent", "trace_id_hex": m.group(1), "parent_span_id": m.group(2), "flags": m.group(3)}
+              else:
+                  want = {"source": "trace_id", "trace_id_hex": case["trace_id"].replace("-", "")}
+              assert case["expect"] == want, f"traceparent {case['name']!r}: disagrees with ADR-0028"
+              total += 1
+          assert set(traceparent) == {"description", "cases"}, "traceparent has only extract cases (out-of-band carriage is left to the R1 OTel plan)"
+
+          # ---- redis_layout (broker-bindings section 1.1) ------------------------------
+          redis_layout = manifest["redis_layout"]
+          names_unique("redis_layout", redis_layout["cases"])
+          for case in redis_layout["cases"]:
+              q, p = case["queue"], case["key_prefix"]
+              assert case["expect"] == {"ready": f"{p}{q}", "delayed": f"{p}{q}:delayed", "reserved": f"{p}{q}:reserved", "notify": f"{p}{q}:notify"}, f"redis_layout {case['name']!r}"
+              total += 1
+
+          # ---- nothing forbidden / no pre-existing expectation moved -------------------
+          for fx in sorted(os.listdir("fixtures")):
+              if fx.startswith(("trim-", "job-type-")):
+                  doc = json.load(open(f"fixtures/{fx}"))
+                  assert "timestamp" not in doc, f"{fx}: forbidden key"
+
+          print(f"✓ v1.5 sections agree with their reference oracles — {total} cases")
+          PY
+
+      - name: Results schema is valid and its example conforms
+        run: |
+          python3 - <<'PY'
+          import json
+          from jsonschema import Draft202012Validator, FormatChecker
+
+          schema = json.load(open("schema/results.schema.json"))
+          Draft202012Validator.check_schema(schema)
+          validator = Draft202012Validator(schema, format_checker=FormatChecker())
+          example = json.load(open("schema/results.example.json"))
+          errors = sorted(validator.iter_errors(example), key=lambda e: list(e.path))
+          assert not errors, "results.example.json does not conform: " + "; ".join(e.message for e in errors)
+
+          manifest = json.load(open("manifest.json"))
+          version = open("CONFORMANCE_VERSION").read().strip()
+          assert example["conformance_version"] == version, "results.example.json must use the current conformance_version"
+
+          def case_ids(value, section, sub=None):
+              # ADR-0032 section 2, "Case id": a case is its `name`, else its 0-based index
+              # (`<section>#<index>` for a section-level case, bare `<index>` under a sub-key)
+              def of(cases):
+                  return [str(c["name"]) if isinstance(c, dict) and "name" in c else (f"{section}#{i}" if sub is None else str(i))
+                          for i, c in enumerate(cases)]
+              if isinstance(value, list):
+                  return of(value)
+              ids = []
+              if isinstance(value.get("cases"), list):
+                  ids += of(value["cases"])
+              for key, item in value.items():
+                  if key in ("description", "schema", "cases") or not isinstance(item, dict):
+                      continue
+                  if isinstance(item.get("cases"), list):
+                      ids += [f"{key}/{i}" for i in case_ids(item["cases"], section, key)]
+                  else:
+                      ids.append(key)
+              return ids
+
+          sections = manifest["sections"]
+          carried = set(example["bindings"])
+          for name, results in example["sections"].items():
+              assert name in sections, f"example section {name!r} is not in the manifest"
+              scope = sections[name]["scope"]
+              assert scope == "core" or scope in carried, f"example section {name!r} has scope {scope!r}, which the package does not carry"
+              ids = set(case_ids(manifest[name], name))
+              unknown = set(results) - ids
+              assert not unknown, f"example section {name!r} has unknown case ids {sorted(unknown)}"
+          for name, entry in sections.items():
+              if entry["scope"] not in ("core", *carried):
+                  assert name not in example["sections"], f"section {name!r} must be absent: binding {entry['scope']!r} is not carried"
+
+          print(f"✓ results.schema.json is a valid 2020-12 schema; results.example.json conforms ({len(example['sections'])} sections)")
+          PY
+
+      - name: Release asset is reproducible and fetch.sh round-trips it
+        run: |
+          set -euo pipefail
+          build_asset() {  # $1 = output dir; the same commands run in release.yml
+            v="$(tr -d '[:space:]' < CONFORMANCE_VERSION)"
+            root="babelqueue-conformance-${v}"
+            rm -rf "$1" stage
+            mkdir -p "$1" "stage/${root}"
+            cp -R CONFORMANCE_VERSION manifest.json schema fixtures LICENSE "stage/${root}/"
+            find "stage/${root}" -type d -exec chmod 755 {} +
+            find "stage/${root}" -type f -exec chmod 644 {} +
+            tar --format=gnu --sort=name --mtime='2026-01-01 00:00:00 UTC' --owner=0 --group=0 --numeric-owner \
+              -C stage -cf - "${root}" | gzip -n -9 > "$1/${root}.tar.gz"
+            (cd "$1" && sha256sum "${root}.tar.gz" > SHA256SUMS)
+          }
+          build_asset dist-a
+          build_asset dist-b
+          cmp dist-a/*.tar.gz dist-b/*.tar.gz
+          a="$(sha256sum dist-a/*.tar.gz | cut -d' ' -f1)"
+          b="$(sha256sum dist-b/*.tar.gz | cut -d' ' -f1)"
+          [ "$a" = "$b" ] || { echo "release asset is not deterministic"; exit 1; }
+          v="$(tr -d '[:space:]' < CONFORMANCE_VERSION)"
+          tmp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/bq-fetched"
+          rm -rf "$tmp"
+          export BQ_CONFORMANCE_BASE_URL="file://$PWD/dist-a"
+          ./fetch.sh "$v" "$tmp"
+          ./fetch.sh --check "$v" "$tmp"
+          diff -r -x LICENSE "$tmp" "stage/babelqueue-conformance-${v}"
+          echo '{}' >> "$tmp/manifest.json"
+          if ./fetch.sh --check "$v" "$tmp" > /dev/null 2>&1; then
+            echo "fetch.sh --check must fail on a drifted vendor dir"; exit 1
+          fi
+          # a corrupted asset must be rejected by the checksum
+          cp -R dist-a dist-bad
+          printf 'x' >> "dist-bad/babelqueue-conformance-${v}.tar.gz"
+          if BQ_CONFORMANCE_BASE_URL="file://$PWD/dist-bad" ./fetch.sh "$v" "$tmp-bad" > /dev/null 2>&1; then
+            echo "fetch.sh must reject a corrupted asset"; exit 1
+          fi
+          echo "✓ release asset is reproducible ($a) and fetch.sh verifies, unpacks and compares it"
+          rm -rf dist-a dist-b dist-bad stage "$tmp" "$tmp-bad"
 
   ci-green:
     name: CI green
