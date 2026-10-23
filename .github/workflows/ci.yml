@@ -522,14 +522,18 @@ jobs:
               total += 1
           names_unique("backoff.retry_republish", backoff["retry_republish"]["cases"])
           for case in backoff["retry_republish"]["cases"]:
-              tier = tier_for(case["retry_tiers_ms"], case["release_delay_ms"])
-              if tier is None:
+              tiers = case["retry_tiers_ms"]
+              if not tiers:
                   assert case["expect"] == "reject", f"retry_republish {case['name']!r}: must reject"
               else:
-                  want = {"tier_ms": tier, "body_attempts": case["attempts"] + 1,
-                          "headers": {"bq-attempts": str(case["attempts"] + 1), "bq-delay": str(case["release_delay_ms"]),
+                  # section 6.5 retry rule: n = min(attempts_before, N-1) + 1, bq-delay is the tier's own delay
+                  n = min(case["attempts"], len(tiers) - 1) + 1
+                  want = {"n": n, "topic": f"{case['work_topic']}.retry.{n}", "tier_ms": tiers[n - 1],
+                          "body_attempts": case["attempts"] + 1,
+                          "headers": {"bq-attempts": str(case["attempts"] + 1), "bq-delay": str(tiers[n - 1]),
                                       "bq-original-topic": case["work_topic"]}}
                   assert case["expect"] == want, f"retry_republish {case['name']!r}: disagrees with section 6.5"
+              assert "release_delay_ms" not in case, f"retry_republish {case['name']!r}: section 6.5 does not take a requested delay"
               total += 1
 
           # ---- traceparent (ADR-0028 / ADR-0025) ---------------------------------------
@@ -563,6 +567,109 @@ jobs:
                   assert "timestamp" not in doc, f"{fx}: forbidden key"
 
           print(f"✓ v1.5 sections agree with their reference oracles — {total} cases")
+          PY
+
+      - name: v1.6 sections agree with their reference oracles
+        run: |
+          python3 - <<'PY'
+          import json, math
+          from fractions import Fraction
+
+          manifest = json.load(open("manifest.json"))
+          total = 0
+
+          def names_unique(section, cases):
+              names = [c["name"] for c in cases]
+              assert len(names) == len(set(names)), f"{section}: duplicate case names"
+
+          # ---- redis_delay (section 1.6): score = floor(now) + ceil(delay) ---------------
+          redis_delay = manifest["redis_delay"]
+          names_unique("redis_delay", redis_delay["cases"])
+          for case in redis_delay["cases"]:
+              want = math.floor(Fraction(repr(case["now"]))) + math.ceil(Fraction(repr(case["delay"])))
+              assert case["expect_score"] == want, f"redis_delay {case['name']!r}: expect_score {case['expect_score']} != floor(now)+ceil(delay) = {want}"
+              total += 1
+          for case in manifest["redis_layout"]["delayed_score"]["cases"]:
+              steps = [st for st in case["steps"] if st["op"] == "push_delayed"]
+              assert steps, f"delayed_score {case['name']!r}: no push_delayed step"
+              for st in steps:
+                  want = math.floor(Fraction(repr(st["now"]))) + math.ceil(Fraction(repr(st["delay"])))
+                  scores = [d["score"] for d in st["expect"]["delayed"]]
+                  assert want in scores, f"delayed_score {case['name']!r}: expected score {want} not in {scores}"
+              total += 1
+
+          # ---- backoff: topic_names, retry_attempt_tier, default_tiers (section 6.4 / 6.5) -
+          backoff = manifest["backoff"]
+          names_unique("backoff.topic_names", backoff["topic_names"]["cases"])
+          for case in backoff["topic_names"]["cases"]:
+              assert case["expect_topic"] == f"{case['work_topic']}.retry.{case['n']}", f"topic_names {case['name']!r}"
+              total += 1
+          names_unique("backoff.retry_attempt_tier", backoff["retry_attempt_tier"]["cases"])
+          for case in backoff["retry_attempt_tier"]["cases"]:
+              tiers = case["retry_tiers_ms"]
+              n = min(case["attempts_before"], len(tiers) - 1) + 1
+              want = {"n": n, "topic": f"{case['work_topic']}.retry.{n}", "tier_ms": tiers[n - 1],
+                      "body_attempts": case["attempts_before"] + 1,
+                      "headers": {"bq-attempts": str(case["attempts_before"] + 1), "bq-delay": str(tiers[n - 1]),
+                                  "bq-original-topic": case["work_topic"]}}
+              if "key" in case:
+                  want["key"] = case["key"]
+              assert case["expect"] == want, f"retry_attempt_tier {case['name']!r}: disagrees with section 6.5"
+              total += 1
+          names_unique("backoff.default_tiers", backoff["default_tiers"]["cases"])
+          for case in backoff["default_tiers"]["cases"]:
+              assert case["expect"] == sorted(set(case["expect"])) and case["expect"] == [5000, 30000, 300000, 1800000], f"default_tiers {case['name']!r}"
+              total += 1
+
+          # ---- retry_backoff (ADR-0034 section 9): d(n) = min(max, base * mult^(n-1)) ----
+          retry_backoff = manifest["retry_backoff"]
+          assert "formula" not in manifest["backoff"], "the formula block moved to the core-scope retry_backoff section"
+          names_unique("retry_backoff", retry_backoff["cases"])
+          for case in retry_backoff["cases"]:
+              d = Fraction(repr(case["retry_backoff"])) * Fraction(repr(case["retry_backoff_multiplier"])) ** (case["n"] - 1)
+              cap = Fraction(repr(case["retry_backoff_max"]))
+              if cap != 0:
+                  d = min(cap, d)
+              if case["retry_jitter"] == "none":
+                  assert Fraction(repr(case["expect_delay_seconds"])) == d, f"retry_backoff {case['name']!r}: expect_delay_seconds != d(n) = {d}"
+                  assert "expect_delay_range_seconds" not in case
+              else:
+                  rng = case["expect_delay_range_seconds"]
+                  assert Fraction(repr(rng["min"])) == 0 and Fraction(repr(rng["max"])) == d, f"retry_backoff {case['name']!r}: range must be 0..d(n) = {d}"
+                  assert "expect_delay_seconds" not in case
+              total += 1
+
+          # ---- redis_layout.migrate: notify count = members moved to ready ---------------
+          # Every migrate/reserve-only case with a single step: moved = due delayed members
+          # (score <= floor(now)) + due reserved members (only when retry_after is not null),
+          # each set capped at migration_batch_size when the case sets one.
+          migrate = manifest["redis_layout"]["migrate"]
+          names_unique("redis_layout.migrate", migrate["cases"])
+          for case in migrate["cases"]:
+              assert len(case["steps"]) == 1, f"migrate {case['name']!r}: oracle models single-step cases"
+              st, state = case["steps"][0], case["state"]
+              floor_now = math.floor(Fraction(repr(st["now"])))
+              batch = case.get("migration_batch_size", -1)
+              def due(entries):
+                  n = sum(1 for e in entries if e["score"] <= floor_now)
+                  return n if batch < 0 else min(n, batch)
+              delayed = state.get("delayed")
+              delayed_n = state["delayed_generate"]["count"] if "delayed_generate" in state else len(delayed or [])
+              delayed_entries = ([{"score": state["delayed_generate"]["score"]}] * delayed_n) if "delayed_generate" in state else (delayed or [])
+              moved_delayed = due(delayed_entries)
+              moved_reserved = due(state.get("reserved", [])) if case["retry_after"] is not None else 0
+              moved = moved_delayed + moved_reserved
+              ex = st["expect"]
+              popped = 1 if st["op"] == "reserve" and ex.get("outcome") == "delivered" else 0
+              assert st["op"] in ("migrate", "reserve"), f"migrate {case['name']!r}: unexpected op"
+              assert ex["notify"] == state.get("notify", 0) + moved - popped, f"migrate {case['name']!r}: notify {ex['notify']} != {state.get('notify', 0)} + {moved} - {popped}"
+              ready_after = ex["ready_generate"]["count"] if "ready_generate" in ex else len(ex["ready"])
+              ready_before = len(state.get("ready", []))
+              assert ready_after == ready_before + moved - popped, f"migrate {case['name']!r}: ready count disagrees with {moved} moved"
+              assert len(ex.get("delayed", delayed_entries)) == delayed_n - moved_delayed, f"migrate {case['name']!r}: delayed remainder disagrees"
+              total += 1
+
+          print(f"✓ v1.6 sections agree with their reference oracles — {total} cases")
           PY
 
       - name: Results schema is valid and its example conforms

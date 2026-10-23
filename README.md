@@ -421,8 +421,10 @@ an in-scope section and always cites an ADR.
 
 A deviation from the wire contract is never a reason to skip: for example a Redis transport
 that does not use the §1.1 key layout fails `redis_layout` and the SDK is fixed. Details the
-contract leaves open (the Redis available-at formula and delayed/reserved sweep, the Kafka
-tier numbering) are not pinned by any section; the Redis ones are left to the R1 Redis plan.
+contract leaves open are not pinned by any section. Since 1.6.0 the Redis available-at formula,
+the delayed/reserved migration, the reserve/release behaviour and the legacy `:processing` sweep
+are pinned (see "Added in 1.6.0" below); the Kafka tier numbering is pinned by the `backoff`
+blocks and the retry delay formula by `retry_backoff`, and the DLQ handling after a poison pop is still left open.
 
 Six sections were added in 1.5.0. Each is kept to what the wire contract actually pins; where
 the contract is silent the section says so in its `description` and tests nothing.
@@ -432,9 +434,35 @@ the contract is silent the section says so in its `description` and tests nothin
 | `trim` | `core` | ADR-0032 §5: the ASCII whitespace set (space, `\t`, `\n`, `\r`, `\f`, `\v`) is trimmed from the `make` input (URN, `trace_id`); U+00A0, U+2003 and U+3000 are *not* whitespace and stay in the value; blank `job` / `urn` / `trace_id` on decode and `accepts`; re-emit never trims (a non-blank `job` and `trace_id` survive byte-for-byte, GR-4). |
 | `job_type` | `core` | ADR-0032 §6: a non-string `job` (null, number, boolean, object, array) is ignored and decode MUST warn; a blank-string `job` falls back to `urn` without a warning; a non-string `urn` is ignored; with no valid identity decode raises. |
 | `delay` | `sqs` | broker-bindings §3.4–3.5: `DelaySeconds` on standard queues, the 900 s cap and FIFO per-message delay raising `BabelQueueException`, and the `ChangeMessageVisibility` timeout of a release. |
-| `backoff` | `kafka` | broker-bindings §6.3–6.5: retry-tier selection (smallest tier ≥ the requested delay, `bq-delay` / `bq-original-topic` headers), reject above the largest tier, and the retry republish (`bq-attempts + 1`, `bq-delay`, `bq-original-topic`, body `attempts` in sync). |
+| `backoff` | `kafka` | broker-bindings §6.3–6.5, two separate rules: the requested-delay rule (§6.4: smallest tier ≥ the requested delay, `bq-delay` = the requested delay, `bq-original-topic`; reject above the largest tier) and the retry/release rule (§6.5: tier `n = min(attempts_before, N−1) + 1`, `bq-delay` = that tier's ms, `bq-attempts = attempts_before + 1`, `bq-original-topic`, body `attempts` in sync; no tiers configured is rejected). The two rules are not merged. |
 | `traceparent` | `otel` | ADR-0028 / ADR-0025: consumer-side extraction of the W3C `traceparent` header (valid header wins, malformed or absent header falls back to the `trace_id`-derived hex, never raises). Only the `00-<32hex>-<16hex>-<2hex>` structure is pinned; the finer W3C rules and the out-of-band carriage on a real transport are left to the R1 OTel plan. |
-| `redis_layout` | `redis` | broker-bindings §1.1: the key names of the Laravel-compatible layout (`queues:<q>`, `:delayed`, `:reserved`, `:notify`). Names only — no available-at formula or sweep is pinned. |
+| `redis_layout` | `redis` | broker-bindings §1.1: the key names of the Laravel-compatible layout (`queues:<q>`, `:delayed`, `:reserved`, `:notify`). In 1.5.0 names only; 1.6.0 adds behavioural blocks (below). |
+
+### Added in 1.6.0 (ADR-0033, ADR-0034)
+
+Version 1.6.0 locks the Redis delay/recovery behaviour, the Kafka retry-tier arithmetic and the
+Kafka poison trigger set. It is a MINOR: the only v1.5.0 case expectation that changed is the `backoff.retry_republish`
+correction, which contradicted broker-bindings §6.5 (see below); every other change is additive.
+
+| Section / block | Scope | Pins |
+| :--- | :--- | :--- |
+| `redis_delay` (new section) | `redis` | broker-bindings §1.6: the delayed score `floor(now) + ceil(delay)` (integer epoch seconds) with the clock pinned by the case (`now`), fractional `now` and `delay` included (`now = 1000.7`, `delay = 1.5` gives `1002`). It is a separate section because `delay` is scoped `sqs` and a section has exactly one scope. The 1.0–3.5 s live-timing window is not a fixture. |
+| `backoff.topic_names`, `retry_attempt_tier`, `default_tiers`; `backoff.retry_republish` (rewritten, see below) | `kafka` | broker-bindings §6.4–6.5 and ADR-0034 §9: the retry topic name `<topic>.retry.<n>` (`n` starts at 1), the tier of a retry `min(attempts_before, N−1) + 1` (the last tier is kept when the tiers run out) and the RECOMMENDED tier constant `[5000, 30000, 300000, 1800000]`. The "`<n>` undefined" note is gone. Kafka does not apply `retry_backoff`: a retry republish uses the tier, not the formula. |
+| `retry_backoff` (new section) | `core` | broker-bindings §6.5 / ADR-0034 §9: the delay formula table `d(n) = min(max, retry_backoff × multiplier^(n−1))` (`max = 0` is uncapped): `jitter = none` exact values including the defaults `multiplier = 1`, `max = 0`; `full` only the bound `[0, d(n)]`. It is a `core` section of its own (moved out of `backoff`, which is scoped `kafka`) because the formula belongs to the SDK core retry policy of every transport, not to Kafka. |
+| `redis_layout.delayed_score`, `migrate`, `reserve`, `pcall_poison`, `release` | `redis` | broker-bindings §1.1, §1.6, §1.7 (zset layout): due delayed items move to the ready list (`score <= floor(now)`), expired reservations return to ready after the delayed pass, in chunks of 100, one notify token per moved item; a reserve hands the handler the raw member byte for byte and stores it in `:reserved` with `attempts + 1`; a body that cannot be decoded or whose `attempts` is not a number is stored raw and reported as poison (the A1 `pcall` guard); a release deletes the reservation and writes the SDK-encoded body to `:delayed` with only `attempts` changed (unknown keys, their types and `{}` versus `[]` survive, ADR-0031). |
+| `redis_layout.processing_sweep`, `processing_token`, `late_ack`, `identical_copies`, `retry_after_null`, `lrem_count`, `malformed_member`, `orphan` | `redis` | broker-bindings §1.7 (legacy `:processing` layout, A11/A13/K1): the sweep moves only the expired item to the end of the ready list byte for byte with `attempts` unchanged; a deadline member is `<32 lowercase hex token>:<raw>`; an ack with the token of an already swept reservation changes nothing; byte-identical copies carry separate members and one ack touches only its own; a member that does not match the format is only `ZREM`'d; an `LREM` that returns 0 only `ZREM`s the member (orphan cleanup); `retry_after: null` writes a `+inf` score so the item itself is never swept, but it is not a kill switch: a consumer with `null` still runs the sweep before every reserve and recovers a foreign expired member (case `retry_after_null/null-consumer-still-sweeps-foreign-expired-member`); `LREM` count is 1. Blocks `legacy_release_gate` and `legacy_dlq_gate` pin the §1.7 gate: `ZREM` of `<token>:<raw>` first, a result of 1 runs `LREM` and the rest in the same script, a result of 0 (stale token) touches nothing; both a stale and a valid token are covered. The reserve deadline is `floor(now) + retry_after` (§1.1). |
+| `kafka_poison` (new section) | `kafka` | broker-bindings §6 and ADR-0034 §10 / ADR-0032 §6: case `{name, body, expect}` with `expect` one of `ok` (decodes), `no_identity` (valid JSON object but no usable `job` / `urn`) or `poison` (the consumer routes the record to the DLQ). A repeated top-level key is last-wins, so "duplicate job number then string" (`{"job":5,"job":"urn:x"}`) is `ok`; three rows of the old table change classification in total: `{"job":5}` and `{"job":"urn:x","job":5}` poison → `no_identity`, and "duplicate job number then string" poison → `ok`.  It replaces the five per-SDK copies of `poison-trigger-set.json`. |
+
+Runner contract for `redis_layout`: the cases in its `cases` array need no Redis; the behavioural
+blocks need a live Redis (`redis:7`). When `BQ_REQUIRE_REDIS` is set, an unreachable Redis is a
+**failure**, never a skip; when it is unset the runner skips the behavioural blocks and logs it.
+Each SDK's Redis transport CI sets `BQ_REQUIRE_REDIS` together with a `redis:7` service
+container. The block-level case DSL (`layout`, `state`, ordered `steps` with `now`, ops
+`push_delayed` / `migrate` / `reserve` / `release` / `ack` / `sweep` / `dead_letter`, count expectations `ready_count` / `dlq_count`) is documented in the
+`redis_layout` section `description` of `manifest.json`; a runner therefore needs hooks that run
+the SDK's migrate and sweep steps on their own and that inject the clock. The migrate and sweep
+chunk size is 100, so the cases that exercise it only check completeness (everything moved), not
+the intermediate state of a partial chunk.
 
 The `trim` cases pin the ASCII-trim rule of `make` only. Some of them feed `make` a Unicode-space
 or space-padded URN; that fixes what the blank check does with it, not that such strings are
@@ -512,6 +540,16 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 `babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
 
 ## Suite version history
+
+- **1.6.0** — ADR-0033, ADR-0034.
+  Adds the sections `redis_delay` (`redis`), `kafka_poison` (`kafka`) and `retry_backoff` (`core`); the `backoff` blocks
+  `topic_names`, `retry_attempt_tier` and `default_tiers`; and the `redis_layout`
+  behavioural blocks `delayed_score`, `migrate`, `reserve`, `pcall_poison`, `release`,
+  `processing_sweep`, `processing_token`, `late_ack`, `identical_copies`, `retry_after_null`,
+  `lrem_count`, `malformed_member`, `orphan`, `legacy_release_gate` and `legacy_dlq_gate`, with the runner contract (`BQ_REQUIRE_REDIS`).
+  Corrects `backoff.retry_republish` to the §6.5 attempt-to-tier rule (the key stays; the earlier
+  `release_delay_ms` expectation contradicted §6.5). Otherwise additive: no other v1.5.0 case expectation changed. Vendored copies may be red on the new cases
+  until each SDK implements ADR-0033 / ADR-0034. See `CHANGELOG.md`.
 
 - **1.5.0** — ADR-0032.
   Adds the sections `trim`, `job_type` (scope `core`), `traceparent` (`otel`), `delay` (`sqs`),
