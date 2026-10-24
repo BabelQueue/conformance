@@ -761,6 +761,25 @@ jobs:
                                    parse_int=parse_int, parse_float=parse_float)
               return decoded, bool(seen), lossy
 
+          # ADR-0035 section 1 leaves depth/resource limits to the writer (PHP's default json nesting limit is 512);
+          # a body nested deeper than this threshold is therefore never plain `splice`, always splice_or_wrapper
+          DEPTH_LIMIT = 512
+
+          def nesting_depth(value):
+              # max container (object/array) nesting, the top-level container being depth 1;
+              # iterative so a deeply nested body cannot hit the recursion limit
+              best = 0
+              stack = [(value, 1)]
+              while stack:
+                  v, d = stack.pop()
+                  if isinstance(v, dict):
+                      best = max(best, d)
+                      stack.extend((c, d + 1) for c in v.values())
+                  elif isinstance(v, list):
+                      best = max(best, d)
+                      stack.extend((c, d + 1) for c in v)
+              return best
+
           def poison_record(raw):
               # strict RFC 8259 object (ADR-0035 section 1): NaN/Infinity/-Infinity and unpaired
               # surrogate escapes are not an object, so they are wrapped
@@ -784,6 +803,7 @@ jobs:
           shapes = set()
           dup_kinds = set()
           lossy_kinds = set()
+          deep_seen = False
           for case in poison_dlq["cases"]:
               assert ("body" in case) != ("body_base64" in case), f"poison_dlq {case['name']!r}: exactly one of body / body_base64"
               raw = case["body"].encode("utf-8") if "body" in case else base64.b64decode(case["body_base64"], validate=True)
@@ -811,6 +831,11 @@ jobs:
                   if repeated:
                       assert ex["shape"] == "splice_or_wrapper", f"poison_dlq {case['name']!r}: a body with a repeated member name must be splice_or_wrapper"
                   dup_kinds.add(("top" if top_repeated else "nested") if repeated else "none")
+                  # a body past the depth threshold may be wrapped by a depth-limited writer (PHP), so a
+                  # plain `splice` expectation would reject a conformant writer
+                  if nesting_depth(want) > DEPTH_LIMIT:
+                      assert ex["shape"] == "splice_or_wrapper", f"poison_dlq {case['name']!r}: a body nested deeper than {DEPTH_LIMIT} must be splice_or_wrapper"
+                      deep_seen = True
               lits = ex.get("splice_literals")
               if ex["shape"] == "splice_or_wrapper":
                   # a strict object a re-encoding writer cannot carry losslessly: byte-level splice
@@ -845,6 +870,7 @@ jobs:
                   assert pc["state"]["ready"][0] in bodies, f"poison_dlq: encode-fails body of {pc['name']!r} must also be a poison_dlq case"
           assert lossy_kinds >= {"overflow", "underflow", "int64", "decimal"}, f"poison_dlq: lossy-number cases must cover overflow, underflow, int64 and decimal, got {sorted(lossy_kinds)}"
           assert dup_kinds == {"none", "top", "nested"}, f"poison_dlq: repeated-member cases must cover a top-level and a nested repeat, got {dup_kinds}"
+          assert deep_seen, f"poison_dlq: a strict-object case nested deeper than {DEPTH_LIMIT} must exist"
           for lit in ("NaN", "Infinity", "-Infinity"):
               # bounded match: a plain substring test would let a -Infinity body satisfy the Infinity requirement
               lit_re = re.compile(r'[:,\[]\s*' + re.escape(lit) + r'(?![\w.])')
