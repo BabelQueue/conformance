@@ -8,7 +8,7 @@ per-version prose history lives in `README.md` under "Suite version history".
 ## 1.6.0
 
 Governing decisions: ADR-0033 (Redis delays and recovery), ADR-0034 (Kafka retry tiers and
-poison), ADR-0032 (suite structure).
+poison), ADR-0035 (poison DLQ record shape), ADR-0032 (suite structure).
 
 ### Added
 
@@ -19,6 +19,27 @@ poison), ADR-0032 (suite structure).
   into it; a repeated top-level key is last-wins. Three old rows change classification: `{"job":5}` and
   `{"job":"urn:x","job":5}` poison to `no_identity`, and "duplicate job number then string"
   (`{"job":5,"job":"urn:x"}`) poison to `ok`.
+- Section `poison_dlq` (scope `core`): 43 cases `{name, body | body_base64, expect: {shape, record}}`
+  pinning the DLQ record of a poison body (ADR-0035, error-handling §6): an object body is spliced
+  (`record` is the body plus `dead_letter`), anything else is wrapped as `{raw, raw_encoding?}` with
+  `raw` the plain string for valid UTF-8 (`raw_encoding` omitted, never `utf8`) and the padded standard
+  base64 plus `raw_encoding: "base64"` for invalid UTF-8 (U+FFFD substitution is forbidden); an object that
+  already carries `dead_letter` is wrapped, not overwritten. Compared as parsed JSON after removing
+  `dead_letter`, never as bytes. "Object" is strict RFC 8259: `NaN` / `Infinity` / `-Infinity` literals and
+  unpaired surrogate escapes (in a key or a value) are wrapped as plain `raw`. A new case shape
+  `splice_or_wrapper` with `splice_literals` covers bodies a re-encoding writer cannot carry losslessly
+  (`1e400`, `-1e400`, `1e-400`, an integer beyond int64, a decimal beyond double precision, nesting depth
+  600) and bodies with a repeated member name (top-level `{"job":"urn:x","job":5}` and nested), whose
+  re-encode keeps only the last value: the record is either the wrapper `{raw: body}` or a byte-level
+  splice that contains every `splice_literals` entry verbatim, has no top-level `raw` / `raw_encoding`
+  member and whose distinct top-level member names other than `dead_letter`, compared as a set, equal `splice_keys`; a re-encode that
+  changes a value or collapses a repeated member fails. The four `encode-fails-*`
+  bodies appear here too. No existing case expectation changes for ADR-0035; its cases are additions only.
+- `redis_layout.pcall_poison`: four `encode-fails-*` cases (`1e400`, `-1e400`, `NaN`, `Infinity` inside
+  `data`) for the second `pcall` of the reserve Lua (the `cjson.encode`, ADR-0033 A1): `cjson.decode` accepts
+  these literals and `cjson.encode` refuses them, so the body decodes with a numeric `attempts` and only the
+  re-encode fails; the expected result is the same raw `{job, job}` poison as the decode failures. The
+  block `description` explains the choice.
 - `backoff` blocks `topic_names`, `retry_attempt_tier` and `default_tiers`
   (broker-bindings §6.4-6.5, ADR-0034 §9).
 - Section `retry_backoff` (scope `core`): the delay formula table (`jitter = none` exact, `full` bounded
@@ -30,7 +51,10 @@ poison), ADR-0032 (suite structure).
   kill switch (the sweep still runs before every reserve); the gate blocks pin the stale-token and
   valid-token paths of the legacy release and dead-letter scripts. The case DSL gains the op
   `dead_letter` and the count expectations `ready_count` / `dlq_count`.
-- `ci.yml` oracles that recompute the expectations of `redis_delay`, `redis_layout.delayed_score`,
+- `ci.yml` oracles that recompute the expectations of `poison_dlq` (an independent reference of the
+  ADR-0035 record shape; every shape covered; strict parsing that rejects `NaN` / `Infinity` literals and
+  unpaired surrogates; repeated member names (a plain `splice` case may not contain one; top-level and nested repeats both covered); the `splice_or_wrapper` literals and `splice_keys` (distinct top-level names, compared as a set); a lossy number (overflow, underflow, integer beyond int64 or beyond 2^53 for a double-only writer, decimal beyond double precision) can never sit in a plain `splice` case, and overflow, underflow, int64 and decimal are each covered; wrapper cases required for each non-JSON literal (matched as a bounded token, so `-Infinity` cannot satisfy `Infinity`) and
+  surrogate form; every `encode-fails-*` body also present in `poison_dlq`) and check the `encode-fails-*` bodies, and of `redis_delay`, `redis_layout.delayed_score`,
   `backoff` (`topic_names`, `retry_attempt_tier`, `default_tiers`, `retry_republish`),
   `retry_backoff` and the `migrate` notify/ready/delayed counts.
 - Runner contract in the `redis_layout` description: behavioural blocks need a live Redis;

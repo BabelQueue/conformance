@@ -669,6 +669,189 @@ jobs:
               assert len(ex.get("delayed", delayed_entries)) == delayed_n - moved_delayed, f"migrate {case['name']!r}: delayed remainder disagrees"
               total += 1
 
+          # ---- redis_layout.pcall_poison: encode-fails-* (ADR-0033 A1 second pcall) -------
+          # The body must decode (attempts is a number) and carry a non-finite number literal
+          # that cjson.decode accepts and cjson.encode refuses; the poison result is the raw body.
+          import base64, decimal, re
+          pcall_cases = manifest["redis_layout"]["pcall_poison"]["cases"]
+          names_unique("redis_layout.pcall_poison", pcall_cases)
+          for case in pcall_cases:
+              if not case["name"].startswith("encode-fails-"):
+                  continue
+              body = case["state"]["ready"][0]
+              ex = case["steps"][0]["expect"]
+              assert len(case["state"]["ready"]) == 1 and len(case["steps"]) == 1, f"pcall_poison {case['name']!r}: single body, single step"
+              assert re.search(r'"n":(1e400|-1e400|NaN|Infinity)\}', body), f"pcall_poison {case['name']!r}: body lacks a non-finite number literal"
+              assert re.search(r'"attempts":\d+', body), f"pcall_poison {case['name']!r}: attempts must be a number so only the re-encode can fail"
+              assert ex["outcome"] == "poison" and ex["handler_body"] == body, f"pcall_poison {case['name']!r}: handler_body must be the raw body"
+              assert ex["reserved"] == [{"member": body, "score": 1000 + case["retry_after"]}] and ex["ready"] == [], f"pcall_poison {case['name']!r}: raw body must sit in :reserved"
+              total += 1
+
+          # ---- poison_dlq (ADR-0035): independent reference for the record shape ----------
+          def reject_constant(name):
+              raise ValueError(f"non-JSON literal {name}")
+
+          def has_lone_surrogate(value):
+              # json.loads turns a paired escape into one code point and leaves a lone one as U+D800..U+DFFF;
+              # iterative so a deeply nested body cannot hit the recursion limit
+              stack = [value]
+              while stack:
+                  v = stack.pop()
+                  if isinstance(v, str):
+                      if any(0xD800 <= ord(ch) <= 0xDFFF for ch in v):
+                          return True
+                  elif isinstance(v, list):
+                      stack.extend(v)
+                  elif isinstance(v, dict):
+                      stack.extend(v.keys())
+                      stack.extend(v.values())
+              return False
+
+          class Obj(dict):
+              dup = False
+
+          def lossy_number_kind(literal, is_int):
+              # which way a JSON number literal is lost by a re-encoding writer's own number type
+              # (int64 / IEEE double), or None when it survives; checked on the literal text;
+              # an integer past 2^53 is lost by a double-only writer (Node) even inside int64
+              if is_int:
+                  digits = literal.lstrip("-")
+                  if len(digits) > 19 or not -(2 ** 63) <= int(literal) <= 2 ** 63 - 1:
+                      return "int64"
+                  if abs(int(literal)) > 2 ** 53:
+                      return "int53"
+                  return None
+              exact = decimal.Decimal(literal)
+              as_float = float(literal)
+              if math.isinf(as_float):
+                  return "overflow"
+              if as_float == 0.0 and exact != 0:
+                  return "underflow"
+              if decimal.Decimal(repr(as_float)) != exact:
+                  return "decimal"
+              return None
+
+          def parse_tracking_duplicates(text):
+              # strict parse that remembers whether any object, at any depth, repeats a member name and
+              # which kinds of lossy number the body holds;
+              # returns (decoded, repeated_anywhere, lossy_kinds); the top-level object also carries .dup
+              seen = []
+              lossy = set()
+
+              def parse_int(s):
+                  kind = lossy_number_kind(s, True)
+                  if kind:
+                      lossy.add(kind)
+                  return int(s) if kind is None else 0
+
+              def parse_float(s):
+                  kind = lossy_number_kind(s, False)
+                  if kind:
+                      lossy.add(kind)
+                  return float(s)
+
+              def hook(pairs):
+                  o = Obj(pairs)
+                  o.dup = len(o) != len(pairs)
+                  if o.dup:
+                      seen.append(o)
+                  return o
+
+              decoded = json.loads(text, parse_constant=reject_constant, object_pairs_hook=hook,
+                                   parse_int=parse_int, parse_float=parse_float)
+              return decoded, bool(seen), lossy
+
+          def poison_record(raw):
+              # strict RFC 8259 object (ADR-0035 section 1): NaN/Infinity/-Infinity and unpaired
+              # surrogate escapes are not an object, so they are wrapped
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeDecodeError:
+                  return {"raw": base64.b64encode(raw).decode("ascii"), "raw_encoding": "base64"}, "wrapper"
+              try:
+                  decoded, _, _ = parse_tracking_duplicates(text)
+              except (ValueError, RecursionError):
+                  decoded = None
+              if isinstance(decoded, dict) and has_lone_surrogate(decoded):
+                  decoded = None
+              if isinstance(decoded, dict) and "dead_letter" not in decoded:
+                  return decoded, "splice"
+              return {"raw": text}, "wrapper"
+
+          poison_dlq = manifest["poison_dlq"]
+          assert manifest["sections"]["poison_dlq"]["scope"] == "core"
+          names_unique("poison_dlq", poison_dlq["cases"])
+          shapes = set()
+          dup_kinds = set()
+          lossy_kinds = set()
+          for case in poison_dlq["cases"]:
+              assert ("body" in case) != ("body_base64" in case), f"poison_dlq {case['name']!r}: exactly one of body / body_base64"
+              raw = case["body"].encode("utf-8") if "body" in case else base64.b64decode(case["body_base64"], validate=True)
+              if "body_base64" in case:
+                  assert base64.b64encode(raw).decode("ascii") == case["body_base64"], f"poison_dlq {case['name']!r}: body_base64 must be canonical padded base64"
+                  try:
+                      raw.decode("utf-8")
+                      raise AssertionError(f"poison_dlq {case['name']!r}: body_base64 is for bodies that are NOT valid UTF-8")
+                  except UnicodeDecodeError:
+                      pass
+              want, shape = poison_record(raw)
+              ex = case["expect"]
+              repeated = False
+              if shape == "splice":
+                  # a repeated member name cannot survive a re-encode (RFC 8259 section 4 only says SHOULD be
+                  # unique, parsers keep the last): such a body is splice_or_wrapper, never plain splice
+                  _, repeated, lossy = parse_tracking_duplicates(raw.decode("utf-8"))
+                  top_repeated = want.dup
+                  # a number the writer's own number type cannot carry (overflow to inf, underflow to 0,
+                  # integer beyond int64 or beyond 2^53 for a double-only writer, decimal beyond double
+                  # precision) cannot survive a re-encode either
+                  if lossy:
+                      assert ex["shape"] == "splice_or_wrapper", f"poison_dlq {case['name']!r}: a body with a lossy number ({sorted(lossy)}) must be splice_or_wrapper"
+                  lossy_kinds |= lossy
+                  if repeated:
+                      assert ex["shape"] == "splice_or_wrapper", f"poison_dlq {case['name']!r}: a body with a repeated member name must be splice_or_wrapper"
+                  dup_kinds.add(("top" if top_repeated else "nested") if repeated else "none")
+              lits = ex.get("splice_literals")
+              if ex["shape"] == "splice_or_wrapper":
+                  # a strict object a re-encoding writer cannot carry losslessly: byte-level splice
+                  # (every literal verbatim) or the wrapper, never a re-encoded copy
+                  assert shape == "splice", f"poison_dlq {case['name']!r}: splice_or_wrapper is only for strict objects"
+                  assert lits and all(isinstance(l, str) and l and l in case["body"] for l in lits), f"poison_dlq {case['name']!r}: splice_literals must be non-empty and occur verbatim in body"
+                  assert ex["record"] == {"raw": case["body"]}, f"poison_dlq {case['name']!r}: record must be the wrapper"
+                  # splice_keys pin the structural check of a byte-level splice: the distinct top-level member
+                  # names of the body (other than dead_letter), compared as a set; repeats collapse
+                  top_keys = set(want.keys()) - {"dead_letter"}
+                  keys = ex.get("splice_keys")
+                  assert isinstance(keys, list) and len(keys) == len(set(keys)) and set(keys) == top_keys, f"poison_dlq {case['name']!r}: splice_keys must list each distinct top-level member name of the body once ({sorted(top_keys)})"
+                  assert not {"raw", "raw_encoding", "dead_letter"} & set(top_keys), f"poison_dlq {case['name']!r}: splice_keys must not collide with raw / raw_encoding / dead_letter"
+                  if repeated:
+                      assert len(lits) >= 2, f"poison_dlq {case['name']!r}: a repeated-member case pins every repeated member text"
+                  shape = "splice_or_wrapper"
+              else:
+                  assert lits is None and "splice_keys" not in ex, f"poison_dlq {case['name']!r}: splice_literals / splice_keys only belong to splice_or_wrapper"
+                  assert ex["record"] == want, f"poison_dlq {case['name']!r}: record disagrees with ADR-0035"
+              assert ex["shape"] == shape, f"poison_dlq {case['name']!r}: shape {ex['shape']} != {shape}"
+              assert "dead_letter" not in ex["record"], f"poison_dlq {case['name']!r}: the record is the body without dead_letter"
+              if "raw_encoding" in ex["record"]:
+                  assert ex["record"]["raw_encoding"] == "base64", f"poison_dlq {case['name']!r}: writers never emit utf8"
+              shapes.add((shape, "raw_encoding" in ex["record"]))
+              total += 1
+          assert shapes == {("splice", False), ("splice_or_wrapper", False), ("wrapper", False), ("wrapper", True)}, f"poison_dlq: every record shape must be covered, got {shapes}"
+          # the strict-object rule is pinned for each non-JSON literal, each unpaired surrogate form,
+          # and the bodies of the redis encode-fails-* cases reach the DLQ record as well
+          bodies = {c.get("body") for c in poison_dlq["cases"]}
+          for pc in pcall_cases:
+              if pc["name"].startswith("encode-fails-"):
+                  assert pc["state"]["ready"][0] in bodies, f"poison_dlq: encode-fails body of {pc['name']!r} must also be a poison_dlq case"
+          assert lossy_kinds >= {"overflow", "underflow", "int64", "decimal"}, f"poison_dlq: lossy-number cases must cover overflow, underflow, int64 and decimal, got {sorted(lossy_kinds)}"
+          assert dup_kinds == {"none", "top", "nested"}, f"poison_dlq: repeated-member cases must cover a top-level and a nested repeat, got {dup_kinds}"
+          for lit in ("NaN", "Infinity", "-Infinity"):
+              # bounded match: a plain substring test would let a -Infinity body satisfy the Infinity requirement
+              lit_re = re.compile(r'[:,\[]\s*' + re.escape(lit) + r'(?![\w.])')
+              assert any(lit_re.search(b) and c["expect"]["shape"] == "wrapper" for c in poison_dlq["cases"] if (b := c.get("body"))), f"poison_dlq: no wrapper case for {lit}"
+          for esc in ("\\ud800\"", "\\udc00", "\\ud800\\u0041", "\\ud800\":"):
+              assert any(esc in b and c["expect"]["shape"] == "wrapper" for c in poison_dlq["cases"] if (b := c.get("body"))), f"poison_dlq: no wrapper case for unpaired surrogate {esc!r}"
+
           print(f"✓ v1.6 sections agree with their reference oracles — {total} cases")
           PY
 
