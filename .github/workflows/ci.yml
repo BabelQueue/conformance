@@ -1057,6 +1057,108 @@ jobs:
           print(f"✓ v1.7 sections agree with their reference oracles — {total} cases")
           PY
 
+      - name: v1.8 sections agree with their reference oracles
+        run: |
+          python3 - <<'PY'
+          import json
+
+          manifest = json.load(open("manifest.json"))
+          sections = manifest["sections"]
+
+          # ---- version_gate_<binding> (ADR-0037 decision 1): independent reference settle function ----------
+          BINDINGS = ("pulsar", "artemis", "sqs", "asb")
+          STRATEGIES = ("fail", "delete", "release", "dead_letter")
+          assert "version_gate" not in manifest and "version_gate" not in sections, "version_gate is split into one section per binding (ADR-0032: exactly one scope per section)"
+          for b in BINDINGS:
+              assert sections[f"version_gate_{b}"] == {"scope": b}, f"version_gate_{b}: the section's scope is exactly {b!r}"
+
+          def settle(c, binding, writer=True):
+              # Decision 1, rules 2-5. writer=False models an SDK in which dead_letter off means no DLQ writer exists.
+              strategy = c.get("on_unknown_urn", "fail")
+              on = c["dead_letter"] == "on"
+              if strategy == "delete":
+                  return "ack"                                           # rule 2
+              if not on and (strategy != "dead_letter" or not writer):   # rule 3 (and the no-writer dead_letter rule)
+                  return "native" if binding in ("sqs", "asb") else "ack"
+              return "dlq_raw" if c.get("dlq_write", "ok") == "ok" else "unsettled"   # rules 4 and 5
+
+          def writes(c, binding):
+              return settle({**c, "dlq_write": "ok"}, binding) == "dlq_raw"
+
+          allowed = {"name", "on_unknown_urn", "dead_letter", "dlq_write", "bq_attempts", "expect"}
+          inputs, bodies_by_binding, total = {}, {}, 0
+          for b in BINDINGS:
+              vg = manifest[f"version_gate_{b}"]
+              assert set(vg) == {"description", "incoming_bodies", "cases"}, f"version_gate_{b}: members {sorted(vg)}"
+              cases = vg["cases"]
+              names = [c["name"] for c in cases]
+              assert len(names) == len(set(names)), f"version_gate_{b}: duplicate case names"
+              for c in cases:
+                  n = f"version_gate_{b} {c['name']!r}"
+                  assert set(c) <= allowed and {"name", "dead_letter", "expect"} <= set(c), f"{n}: members {sorted(c)}"
+                  assert c.get("on_unknown_urn", "fail") in STRATEGIES, f"{n}: on_unknown_urn"
+                  assert c["dead_letter"] in ("on", "off"), f"{n}: dead_letter"
+                  assert c.get("dlq_write", "ok") in ("ok", "fails"), f"{n}: dlq_write"
+                  if "bq_attempts" in c:
+                      assert isinstance(c["bq_attempts"], str) and c["bq_attempts"].isdigit(), f"{n}: bq_attempts is a string of digits"
+                  exp = c["expect"]
+                  assert set(exp) <= {"outcome", "record", "outcome_no_writer"} and "outcome" in exp, f"{n}: expect members {sorted(exp)}"
+                  assert exp["outcome"] in ("ack", "dlq_raw", "unsettled", "native"), f"{n}: outcome"
+                  assert exp["outcome"] == settle(c, b), f"{n}: outcome {exp['outcome']} but the rule gives {settle(c, b)}"
+                  # dlq_write is present exactly on the rows that write a record (outcome dlq_raw or unsettled) and on the
+                  # dead_letter-with-dead_letter-off rows (a writable DLQ target writes there; outcome_no_writer covers the rest)
+                  dl_off_strategy = c.get("on_unknown_urn") == "dead_letter" and c["dead_letter"] == "off"
+                  assert ("dlq_write" in c) == (writes(c, b) or dl_off_strategy), f"{n}: dlq_write must be present exactly on rows that write"
+                  # the byte-for-byte record expectation is on every dlq_raw row and only there
+                  assert ("record" in exp) == (exp["outcome"] == "dlq_raw"), f"{n}: expect.record belongs on dlq_raw rows only"
+                  assert exp.get("record", "incoming_body") == "incoming_body", f"{n}: expect.record"
+                  # outcome_no_writer exactly on strategy dead_letter + off, and it is the reference no-writer result
+                  no_writer = settle(c, b, writer=False)
+                  if dl_off_strategy:
+                      assert exp.get("outcome_no_writer") == no_writer, f"{n}: outcome_no_writer must be {no_writer!r}, got {exp.get('outcome_no_writer')!r}"
+                  else:
+                      assert "outcome_no_writer" not in exp, f"{n}: outcome_no_writer is only for the dead_letter strategy with dead-lettering off"
+                      assert no_writer == exp["outcome"], f"{n}: only a no-writer row may change without a writer"
+                  total += 1
+
+              # coverage: every strategy (absent counts as fail) x dead_letter setting has a row, a row that writes has both a
+              # successful and a failing write, bq_attempts rows exist with dead-lettering on and off, every outcome of the binding appears
+              for strategy in (None, "fail", "release", "delete", "dead_letter"):
+                  for dl in ("on", "off"):
+                      sel = [c for c in cases if c.get("on_unknown_urn") == strategy and c["dead_letter"] == dl]
+                      assert sel, f"version_gate_{b}: no row for strategy {strategy}, dead_letter {dl}"
+                      if any("dlq_write" in c for c in sel):
+                          assert {c["dlq_write"] for c in sel} == {"ok", "fails"}, f"version_gate_{b}: strategy {strategy}, dead_letter {dl} needs a write-ok and a write-fails row"
+              assert any("bq_attempts" in c and c["dead_letter"] == "on" for c in cases) and any("bq_attempts" in c and c["dead_letter"] == "off" for c in cases), \
+                  f"version_gate_{b}: bq_attempts rows (dead-lettering on and off) missing"
+              want = {"ack", "dlq_raw", "unsettled"} | ({"native"} if b in ("sqs", "asb") else set())
+              assert {c["expect"]["outcome"] for c in cases} == want, f"version_gate_{b}: every outcome of the binding must be covered"
+              assert sum("outcome_no_writer" in c["expect"] for c in cases) == 2, f"version_gate_{b}: the dead_letter strategy with dead-lettering off needs a write-ok and a write-fails row"
+              inputs[b] = sorted(json.dumps({k: v for k, v in c.items() if k not in ("name", "expect")}, sort_keys=True) for c in cases)
+
+              # incoming_bodies: raw-bytes probes for 'expect.record: incoming_body'. Each must differ from its canonical
+              # re-encoding, otherwise a writer that decodes and re-encodes would still pass.
+              bodies = vg["incoming_bodies"]
+              bodies_by_binding[b] = bodies
+              assert bodies and len({x["name"] for x in bodies}) == len(bodies), f"version_gate_{b}: incoming_bodies needs unique names"
+              parsed = 0
+              for x in bodies:
+                  assert set(x) == {"name", "body"} and isinstance(x["body"], str) and x["body"], f"version_gate_{b} incoming_bodies {x.get('name')!r}: shape"
+                  try:
+                      value = json.loads(x["body"])
+                  except ValueError:
+                      continue   # not JSON: any re-encoding changes it
+                  parsed += 1
+                  for kwargs in ({"ensure_ascii": False}, {"ensure_ascii": True}, {"ensure_ascii": False, "sort_keys": True}):
+                      assert json.dumps(value, separators=(",", ":"), **kwargs) != x["body"], f"version_gate_{b} incoming_bodies {x['name']!r} equals a canonical re-encoding {kwargs}"
+              assert 0 < parsed < len(bodies), f"version_gate_{b}: incoming_bodies needs both JSON and non-JSON bodies"
+
+          # the four sections drive the same inputs and the same probe bodies; only the expected outcomes differ by binding
+          assert all(inputs[b] == inputs["pulsar"] for b in BINDINGS), "version_gate_*: the four sections must hold the same case inputs"
+          assert all(bodies_by_binding[b] == bodies_by_binding["pulsar"] for b in BINDINGS), "version_gate_*: the four sections must hold the same incoming_bodies"
+          print(f"✓ version_gate_* agree with the ADR-0037 settle rule — {total} cases in {len(BINDINGS)} sections")
+          PY
+
       - name: Results schema is valid and its example conforms
         run: |
           python3 - <<'PY'
