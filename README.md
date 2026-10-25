@@ -424,7 +424,7 @@ that does not use the §1.1 key layout fails `redis_layout` and the SDK is fixed
 contract leaves open are not pinned by any section. Since 1.6.0 the Redis available-at formula,
 the delayed/reserved migration, the reserve/release behaviour and the legacy `:processing` sweep
 are pinned (see "Added in 1.6.0" below); the Kafka tier numbering is pinned by the `backoff`
-blocks and the retry delay formula by `retry_backoff`, and, since ADR-0035, the DLQ record of a poison body by `poison_dlq`.
+blocks and the retry delay formula by `retry_backoff`, and, since ADR-0035, the DLQ record of a poison body by `poison_dlq`. Since 1.7.0 the body classification outside Kafka is pinned by `identity_verdict` and the Pulsar max-attempts settle decision by `pulsar_exhaustion` (see "Added in 1.7.0" below).
 
 Six sections were added in 1.5.0. Each is kept to what the wire contract actually pins; where
 the contract is silent the section says so in its `description` and tests nothing.
@@ -478,6 +478,22 @@ array yields the case's `name`, or `<section>#<0-based index>` when it has none;
 has its own `cases` array yields `<sub-key>/<name>` (`<sub-key>/<0-based index>` when
 unnamed); any other object sub-key is a single case keyed by the sub-key; `description` and
 `schema` are not cases; the top-level `cases` array is the section named `cases`.
+
+### Added in 1.7.0 (ADR-0036)
+
+Version 1.7.0 locks the post-R1 parity rules that can be tested without a broker: how a body is
+classified outside Kafka, and the Pulsar max-attempts settle decision. It is a MINOR: two new
+sections, no existing case or expectation changes.
+
+| Section | Scope | Pins |
+| :--- | :--- | :--- |
+| `identity_verdict` (new section) | `core` | ADR-0036 decision 4 / ADR-0032 §6: case `{name, body, expect}` with `expect` one of `ok` (the body decodes into an envelope with a valid identity) or `poison` (it does not: a decode error, or no valid identity). A runner feeds `body` (the raw message body as a JSON string) to the SDK core decoder. The case set starts with every `kafka_poison` case (same names, bodies and order) with `no_identity` mapped to `poison`, so the two sections stay in step; 5 extra rows after them pin the ADR-0036 decision 4 bodies `kafka_poison` does not hold (a `job` of `""`, `" \t"`, `null` or `{}` next to a valid `urn` is `ok`; a tab-only `job` without `urn` is `poison`). A CI oracle derives the first 92 and checks the extras with its own identity rule. Outside Kafka a `poison` body takes the poison route (never a handler, never the unknown-URN strategies, ADR-0035 record with `reason: poison`), exactly as on Kafka. The out-of-band identity edge (`bq-job` on Pulsar / Kafka) is not covered. |
+| `pulsar_exhaustion` (new section) | `pulsar` | ADR-0036 decisions 1 and 2 / broker-bindings §5.5: the settle decision as a pure function. Case `{name, kind, body_attempts?, bq_attempts?, redelivery_count, max_attempts?, dead_letter, on_unknown_urn?, expect}`; `kind` is `failed`, `unknown_urn` or `poison`; `max_attempts` absent = the default 3; `on_unknown_urn` absent = `fail`; `dead_letter` is a boolean. `reconciled = max(bq_attempts or body_attempts, redelivery_count)`, `counted = reconciled + 1`, and `expect.outcome` is `retry` (`counted < max_attempts`), `dlq` (with `reason` and, for `failed` / `unknown_urn`, `dead_letter_attempts = counted`) or `drop`. A `poison` body has no decodable attempts (its inputs are `bq_attempts` and `redelivery_count` only), is never retried when dead-lettering is on, and takes the bounded `fail` path when it is off. Rows that carry `on_unknown_urn` apply only to an SDK with that strategy option (the Go and Python runtimes and the PHP `Consume\Dispatcher`); a runner for the Java, .NET or Node consumer reports them as `skip`, not `pass`. A CI oracle recomputes every `expect` from the inputs. `dead_letter: false` has two meanings: in Go and Python it is the dead-letter setting only (the DLQ target stays writable, so `on_unknown_urn: dead_letter` still writes a record, `expect.outcome` `dlq`), in the PHP `Dispatcher` it means no `DeadLetterPublisher` (nothing can be written). A row whose result differs carries `expect.outcome_no_writer` (`drop`, acknowledge and log; owner decision 2026-10-25, ADR-0036 decision 3): a runner for an SDK without a DLQ writer (the PHP `Dispatcher`) asserts it instead of `expect.outcome`, every other runner ignores it, and when it is absent both assert `expect.outcome`. It is present on exactly two rows (`on_unknown_urn: dead_letter`, `dead_letter: false`, `poison` and `unknown_urn`); on Kafka the `Dispatcher` rethrows instead, outside this Pulsar-scoped section. |
+
+What stays outside conformance (no broker-less test): the DLQ write itself, the acknowledgement
+after a successful write and the negative acknowledgement after a failed one, the PHP queue name
+of ADR-0036 decision 3, and ADR-0036 decisions 5 and 7. Each SDK covers them in its own tests and
+in the live interop proofs.
 
 ## Results format (ADR-0032)
 
@@ -542,6 +558,12 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 `babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
 
 ## Suite version history
+
+- **1.7.0** — ADR-0036.
+  Adds the sections `identity_verdict` (`core`: every `kafka_poison` body, `no_identity` mapped to `poison`)
+  and `pulsar_exhaustion` (`pulsar`: the max-attempts settle decision, `retry` | `dlq` | `drop`). Additive:
+  no v1.6.0 case or expectation changed; `fetch.sh` is untouched. An SDK that has not implemented ADR-0036
+  fails the new sections until its parity phase lands. See `CHANGELOG.md`.
 
 - **1.6.0** — ADR-0033, ADR-0034, ADR-0035.
   Adds the sections `redis_delay` (`redis`), `kafka_poison` (`kafka`), `retry_backoff` (`core`) and `poison_dlq` (`core`, ADR-0035; plus four `redis_layout.pcall_poison` `encode-fails-*` cases); the `backoff` blocks

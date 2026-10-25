@@ -881,6 +881,182 @@ jobs:
           print(f"✓ v1.6 sections agree with their reference oracles — {total} cases")
           PY
 
+      - name: v1.7 sections agree with their reference oracles
+        run: |
+          python3 - <<'PY'
+          import json, re
+
+          manifest = json.load(open("manifest.json"))
+          total = 0
+
+          def names_unique(section, cases):
+              names = [c["name"] for c in cases]
+              assert len(names) == len(set(names)), f"{section}: duplicate case names"
+
+          # ---- identity_verdict (ADR-0036 decision 4): derived from kafka_poison ---------------
+          sections = manifest["sections"]
+          assert sections["identity_verdict"]["scope"] == "core", "identity_verdict is a core section"
+          assert sections["pulsar_exhaustion"]["scope"] == "pulsar", "pulsar_exhaustion is a pulsar section"
+          iv = manifest["identity_verdict"]["cases"]
+          kp = manifest["kafka_poison"]["cases"]
+          names_unique("identity_verdict", iv)
+          assert [(c["name"], c["body"]) for c in iv[:len(kp)]] == [(c["name"], c["body"]) for c in kp], \
+              "identity_verdict must start with every kafka_poison case: same names, bodies and order"
+          for case, src in zip(iv, kp):
+              assert set(case) == {"name", "body", "expect"}, f"identity_verdict {case['name']!r}: unexpected members {sorted(case)}"
+              assert case["expect"] in ("ok", "poison"), f"identity_verdict {case['name']!r}: expect is ok or poison"
+              assert case["expect"] == ("ok" if src["expect"] == "ok" else "poison"), \
+                  f"identity_verdict {case['name']!r}: must be ok for kafka_poison ok, poison for no_identity and poison"
+              total += 1
+
+          extra = iv[len(kp):]
+          assert extra, "identity_verdict: the extra ADR-0036 decision 4 rows are missing"
+          for case in extra:
+              assert set(case) == {"name", "body", "expect"} and case["expect"] in ("ok", "poison"), f"identity_verdict {case['name']!r}: shape"
+              total += 1
+
+          # An independent one-way check with Python's own parser (last duplicate wins, like the rule):
+          # a body Python cannot parse as a strict JSON object, or one with no valid identity, can never be ok,
+          # and an ok body always parses and has an identity. (A poison verdict for a wrongly typed known member
+          # is not recomputed here; that part is the kafka_poison table.)
+          def reject_constant(name):
+              raise ValueError(f"non-JSON literal {name}")
+
+          def identity_state(text):
+              try:
+                  value = json.loads(text, parse_constant=reject_constant)
+              except (ValueError, RecursionError):
+                  return "undecodable"
+              if not isinstance(value, dict):
+                  return "undecodable"
+              job, urn = value.get("job"), value.get("urn")
+              if isinstance(job, str) and job.strip(" \t\n\r\f\v") != "":
+                  return "identity"
+              if isinstance(urn, str) and urn.strip(" \t\n\r\f\v") != "":
+                  return "identity"
+              return "no_identity"
+
+          kp_bodies = {c["body"] for c in kp}
+          for case in extra:
+              # an extra row is a simple object, so its verdict is exactly the identity rule
+              assert case["body"] not in kp_bodies, f"identity_verdict {case['name']!r}: an extra row must not repeat a kafka_poison body"
+              want = "ok" if identity_state(case["body"]) == "identity" else "poison"
+              assert case["expect"] == want, f"identity_verdict {case['name']!r}: expect {case['expect']} but the identity rule says {want}"
+          for case in iv:
+              state = identity_state(case["body"])
+              if case["expect"] == "ok":
+                  assert state == "identity", f"identity_verdict {case['name']!r}: ok needs a parseable object with a valid identity, got {state}"
+              if state != "identity":
+                  assert case["expect"] == "poison", f"identity_verdict {case['name']!r}: {state} body must be poison"
+
+          # The ADR-0036 decision 4 table: these bodies (by case name) carry these verdicts.
+          by_name = {c["name"]: c["expect"] for c in iv}
+          required = {
+              "full valid": "ok", "urn alias string": "ok", "urn alias padded": "ok",
+              "job blank with valid urn alias": "ok", "job number with valid urn alias": "ok",
+              "empty object": "poison", "job number": "poison", "job null": "poison", "urn alias number": "poison",
+              "null literal": "poison", "empty array": "poison", "string": "poison", "number": "poison",
+              "not json": "poison", "empty": "poison",
+          }
+          for name, want in required.items():
+              assert by_name.get(name) == want, f"identity_verdict: case {name!r} must be {want}, got {by_name.get(name)!r}"
+          # The bodies the ADR-0036 decision 4 table lists, matched by the parsed value (not by the spelling), must
+          # all be present with the listed verdict: job "" / " \t" / 5 / null / {} next to a valid urn is ok.
+          verdicts = {}
+          for c in iv:
+              try:
+                  obj = json.loads(c["body"])
+              except ValueError:
+                  continue
+              if isinstance(obj, dict):
+                  verdicts.setdefault(json.dumps(obj, sort_keys=True), set()).add(c["expect"])
+          for job in ("", " \t", 5, None, {}):
+              key = json.dumps({"job": job, "urn": "urn:x"}, sort_keys=True)
+              assert verdicts.get(key) == {"ok"}, f"identity_verdict: the ADR-0036 body with job {job!r} and a valid urn must be present and ok"
+          assert verdicts.get(json.dumps({"job": " \t"}, sort_keys=True)) == {"poison"}, "identity_verdict: a tab-only job without urn must be present and poison"
+          assert {"ok", "poison"} <= set(by_name.values()), "identity_verdict must hold both verdicts"
+          print(f"✓ identity_verdict agrees with kafka_poison and the ADR-0036 table — {len(iv)} cases ({len(extra)} extra)")
+
+          # ---- pulsar_exhaustion (ADR-0036 decisions 1 and 2): independent reference settle function ----
+          DEFAULT_MAX = 3
+          pe = manifest["pulsar_exhaustion"]["cases"]
+          names_unique("pulsar_exhaustion", pe)
+
+          def settle(c, writer=True):
+              # writer=False models an SDK without a DLQ writer: the PHP Dispatcher without a DeadLetterPublisher
+              # (dead_letter false), where nothing can be written (ADR-0036 decision 3)
+              bq = c.get("bq_attempts")
+              if bq is not None:
+                  assert isinstance(bq, str) and re.fullmatch(r"[0-9]+", bq), f"{c['name']!r}: bq_attempts is a string of digits"
+                  reconciled = int(bq)
+              else:
+                  reconciled = c.get("body_attempts", 0)
+              reconciled = max(reconciled, c["redelivery_count"])
+              counted = reconciled + 1
+              mx = c.get("max_attempts", DEFAULT_MAX)
+              assert mx >= 1, f"{c['name']!r}: a max_attempts below 1 is not a case"
+              strategy, dl, kind = c.get("on_unknown_urn", "fail"), c["dead_letter"], c["kind"]
+              assert strategy in ("fail", "delete", "release", "dead_letter"), f"{c['name']!r}: unknown strategy"
+              no_writer = (not writer) and not dl
+              bounded = {"outcome": "retry"} if counted < mx else (
+                  {"outcome": "dlq", "reason": "failed" if kind == "failed" else "unknown_urn", "dead_letter_attempts": counted}
+                  if dl else {"outcome": "drop"})
+              if kind == "poison":
+                  if strategy == "delete":
+                      return {"outcome": "drop"}
+                  if strategy == "dead_letter":  # writes the record where a DLQ writer exists, whatever the setting says
+                      return {"outcome": "drop"} if no_writer else {"outcome": "dlq", "reason": "poison"}
+                  if dl:  # strategy fail / release: dead-lettering on is a poison record, never a retry
+                      return {"outcome": "dlq", "reason": "poison"}
+                  return {"outcome": "retry"} if counted < mx else {"outcome": "drop"}
+              if kind == "unknown_urn":
+                  assert strategy != "release", f"{c['name']!r}: unknown_urn with release is not a case (unknown_urn_release_delay known gap)"
+                  if strategy == "delete":
+                      return {"outcome": "drop"}
+                  if strategy == "dead_letter":  # direct dead-letter, or drop + log without a writer
+                      return {"outcome": "drop"} if no_writer else {"outcome": "dlq", "reason": "unknown_urn"}
+                  return bounded
+              assert kind == "failed" and strategy == "fail", f"{c['name']!r}: a failing handler has no unknown-URN strategy"
+              return bounded
+
+          allowed = {"name", "kind", "body_attempts", "bq_attempts", "redelivery_count", "max_attempts", "dead_letter", "on_unknown_urn", "expect"}
+          for case in pe:
+              assert set(case) <= allowed and {"name", "kind", "redelivery_count", "dead_letter", "expect"} <= set(case), f"pulsar_exhaustion {case['name']!r}: members {sorted(case)}"
+              assert case["kind"] in ("failed", "unknown_urn", "poison"), f"pulsar_exhaustion {case['name']!r}: kind"
+              assert isinstance(case["dead_letter"], bool) and isinstance(case["redelivery_count"], int) and case["redelivery_count"] >= 0
+              if case["kind"] == "poison":
+                  assert "body_attempts" not in case, f"pulsar_exhaustion {case['name']!r}: a poison body has no decodable attempts"
+              else:
+                  assert isinstance(case.get("body_attempts"), int) and case["body_attempts"] >= 0, f"pulsar_exhaustion {case['name']!r}: body_attempts"
+              expect = dict(case["expect"])
+              no_writer = expect.pop("outcome_no_writer", None)
+              assert expect == settle(case), f"pulsar_exhaustion {case['name']!r}: {expect} disagrees with the ADR-0036 decision {settle(case)}"
+              # outcome_no_writer: present exactly on the rows where an SDK without a DLQ writer settles differently
+              want_nw = settle(case, writer=False)["outcome"]
+              if want_nw != expect["outcome"]:
+                  assert no_writer == want_nw, f"pulsar_exhaustion {case['name']!r}: outcome_no_writer must be {want_nw!r}, got {no_writer!r}"
+              else:
+                  assert no_writer is None, f"pulsar_exhaustion {case['name']!r}: outcome_no_writer is only for a row whose result differs without a writer"
+              total += 1
+          # every outcome, kind, strategy and reason is covered
+          assert {c["expect"]["outcome"] for c in pe} == {"retry", "dlq", "drop"}, "pulsar_exhaustion: retry, dlq and drop must all be covered"
+          assert {c["kind"] for c in pe} == {"failed", "unknown_urn", "poison"}, "pulsar_exhaustion: every kind must be covered"
+          assert {c.get("on_unknown_urn") for c in pe} >= {None, "delete", "release", "dead_letter"}, "pulsar_exhaustion: every strategy row must be covered"
+          assert {c["expect"].get("reason") for c in pe if c["expect"]["outcome"] == "dlq"} == {"failed", "unknown_urn", "poison"}, "pulsar_exhaustion: every dlq reason must be covered"
+          assert any("bq_attempts" in c for c in pe) and any(c["redelivery_count"] > c.get("body_attempts", 0) for c in pe), \
+              "pulsar_exhaustion: the reconciliation inputs (bq_attempts, redelivery_count) must be exercised"
+          assert {c["name"] for c in pe if "outcome_no_writer" in c["expect"]} == {
+              "poison-dead-letter-strategy-dlq-off-dead-letters", "unknown-urn-dead-letter-strategy-dlq-off-dead-letters-directly"}, \
+              "pulsar_exhaustion: outcome_no_writer belongs on the two dead_letter-strategy rows with dead-lettering off (ADR-0036)"
+          for kind in ("poison", "unknown_urn"):
+              assert {c["dead_letter"] for c in pe if c["kind"] == kind and c.get("on_unknown_urn") == "dead_letter"} == {True, False}, \
+                  f"pulsar_exhaustion: the dead_letter strategy must be covered with dead-lettering on and off for {kind}"
+          assert any(c.get("max_attempts") == 1 for c in pe) and any(c.get("max_attempts", 3) > 3 for c in pe), "pulsar_exhaustion: max_attempts 1 and above the default must be covered"
+          print(f"✓ pulsar_exhaustion agrees with the ADR-0036 settle decision — {len(pe)} cases")
+
+          print(f"✓ v1.7 sections agree with their reference oracles — {total} cases")
+          PY
+
       - name: Results schema is valid and its example conforms
         run: |
           python3 - <<'PY'

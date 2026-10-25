@@ -5,6 +5,52 @@ All notable changes to the conformance suite. The version is `CONFORMANCE_VERSIO
 case that contradicted the contract, which a MINOR may correct and must list explicitly). The
 per-version prose history lives in `README.md` under "Suite version history".
 
+## 1.7.0
+
+Governing decision: ADR-0036 (post-R1 parity), with ADR-0032 (suite structure and the identity rule,
+section 6) and ADR-0035 (poison DLQ record).
+
+### Added
+
+- Section `identity_verdict` (scope `core`): 97 cases `{name, body, expect: ok | poison}` (ADR-0036
+  decision 4). The first 92 are every `kafka_poison` case (same names, bodies and order) with
+  `no_identity` mapped to `poison` and `ok` / `poison` unchanged; 5 extra rows pin the ADR bodies
+  `kafka_poison` does not hold (`job` `""`, `" \t"`, `null`, `{}` next to a valid `urn`: `ok`; a tab-only
+  `job` without `urn`: `poison`). A runner feeds `body` to the core decoder. Outside Kafka a `poison`
+  body takes the poison route, not the unknown-URN strategies.
+- Section `pulsar_exhaustion` (scope `pulsar`): 29 cases
+  `{name, kind, body_attempts?, bq_attempts?, redelivery_count, max_attempts?, dead_letter, on_unknown_urn?, expect}`
+  with `expect.outcome` `retry` | `dlq` | `drop` (and `reason`, `dead_letter_attempts` for `dlq`)
+  (ADR-0036 decisions 1 and 2, broker-bindings section 5.5). `counted = reconciled + 1` with
+  `reconciled = max(bq_attempts or body_attempts, redelivery_count)`; the default `max_attempts` is 3.
+  15 rows of the ADR table, 10 strategy rows (only for an SDK with the `on_unknown_urn` option: Go,
+  Python and the PHP `Consume\Dispatcher`; the Java, .NET and Node consumers report them as `skip`). The two
+  rows with `on_unknown_urn: dead_letter` and `dead_letter: false` expect `outcome: dlq` (Go and Python: the
+  setting is off but the DLQ target is writable) and carry the new optional field `expect.outcome_no_writer: drop`,
+  which a runner for an SDK without a DLQ writer (the PHP `Dispatcher` without a `DeadLetterPublisher`) asserts
+  instead (owner decision 2026-10-25, ADR-0036 decision 3); the field is present only where the two results differ.
+  Plus 4 reconciliation-input rows.
+- `ci.yml` step "v1.7 sections agree with their reference oracles": derives the first 92 `identity_verdict`
+  cases from `kafka_poison` (names, bodies, order, verdict mapping), requires the 5 extra ADR rows (matched by
+  parsed value, so the check cannot pass vacuously) and cross-checks the section one-way with Python's own strict
+  parser and the ADR-0036 decision 4 table, and recomputes every `pulsar_exhaustion` `expect` with an
+  independent reference settle function (once with a DLQ writer for `outcome`, once without for
+  `outcome_no_writer`, which must be present exactly where the two differ), with coverage assertions (every outcome, kind, strategy and
+  reason; `max_attempts` 1 and above the default; the reconciliation inputs).
+
+### Changed
+
+- `CONFORMANCE_VERSION`, `manifest.json` `conformance_version` and `schema/results.example.json` carry
+  `1.7.0`. The `sections` map gained `identity_verdict` (`core`) and `pulsar_exhaustion` (`pulsar`).
+
+### Compatibility
+
+- No v1.6.0 case or expectation changed; `fetch.sh` and `schema/results.schema.json` are untouched, so the
+  `BQ_FETCH_SH_SHA256` pins stay valid. A runner that enumerates sections from the `sections` map picks the
+  new sections up; an SDK that has not implemented ADR-0036 fails them until its parity phase lands.
+- The release asset is published from the `v1.7.0` tag by the maintainer; until then SDK repositories
+  vendor this suite from the local checkout with `sync.sh`.
+
 ## 1.6.0
 
 Governing decisions: ADR-0033 (Redis delays and recovery), ADR-0034 (Kafka retry tiers and
