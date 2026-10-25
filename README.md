@@ -424,7 +424,7 @@ that does not use the §1.1 key layout fails `redis_layout` and the SDK is fixed
 contract leaves open are not pinned by any section. Since 1.6.0 the Redis available-at formula,
 the delayed/reserved migration, the reserve/release behaviour and the legacy `:processing` sweep
 are pinned (see "Added in 1.6.0" below); the Kafka tier numbering is pinned by the `backoff`
-blocks and the retry delay formula by `retry_backoff`, and, since ADR-0035, the DLQ record of a poison body by `poison_dlq`. Since 1.7.0 the body classification outside Kafka is pinned by `identity_verdict` and the Pulsar max-attempts settle decision by `pulsar_exhaustion` (see "Added in 1.7.0" below).
+blocks and the retry delay formula by `retry_backoff`, and, since ADR-0035, the DLQ record of a poison body by `poison_dlq`. Since 1.7.0 the body classification outside Kafka is pinned by `identity_verdict` and the Pulsar max-attempts settle decision by `pulsar_exhaustion` (see "Added in 1.7.0" below). Since 1.8.0 the version-gate settle rule (Pulsar, Artemis, SQS, Azure Service Bus) is pinned by `version_gate_pulsar` / `version_gate_artemis` / `version_gate_sqs` / `version_gate_asb` (see "Added in 1.8.0" below).
 
 Six sections were added in 1.5.0. Each is kept to what the wire contract actually pins; where
 the contract is silent the section says so in its `description` and tests nothing.
@@ -495,6 +495,45 @@ after a successful write and the negative acknowledgement after a failed one, th
 of ADR-0036 decision 3, and ADR-0036 decisions 5 and 7. Each SDK covers them in its own tests and
 in the live interop proofs.
 
+### Added in 1.8.0 (ADR-0037)
+
+Version 1.8.0 locks the version-gate settle rule of ADR-0037 decision 1 and widens the runners that must run
+`poison_dlq`. It is a MINOR: four new sections, no existing case or expectation changes.
+
+| Section | Scope | Pins |
+| :--- | :--- | :--- |
+| `version_gate_pulsar`, `version_gate_artemis`, `version_gate_sqs`, `version_gate_asb` (new sections) | `pulsar`, `artemis`, `sqs`, `asb` (one each) | ADR-0037 decision 1 / broker-bindings §5.7 (Pulsar), §7.7 (Artemis), §3.7 (SQS), §4.7 (Azure Service Bus): how a consumer settles a delivery whose schema-version property is present, not null, not blank and not the supported version, as a pure function. Each section holds 17 cases `{name, on_unknown_urn?, dead_letter, dlq_write?, bq_attempts?, expect}` (the same 17 inputs in all four; only the expected outcome differs by binding) and the member `incoming_bodies`. `on_unknown_urn` is `fail` \| `delete` \| `release` \| `dead_letter` (absent = `fail`; only the Java, .NET and Node Pulsar and Azure Service Bus consumers have no strategy option (the Azure Service Bus ones have just an `onUnknownUrn` callback) and report a non-`fail` row of `version_gate_pulsar` / `version_gate_asb` as `skip` citing ADR-0037; every row of `version_gate_artemis` and `version_gate_sqs` is asserted by every SDK that ships a consumer; `release` behaves as `fail` here; the gate reads only the explicitly configured strategy, `fail` when none is set, and an `onUnknownUrn` hook or the strategy a hook implies never affects it). `dead_letter` is `on` \| `off`. `dlq_write` (`ok` \| `fails`; absent = `ok`) is read only on rows whose `expect.outcome` writes a record; it is present on those rows and on the `dead_letter`-strategy rows with `dead_letter: off`. `bq_attempts` (a string) is present only to show the outcome does not depend on it. `expect.outcome`: `ack` (acknowledged and dropped, logged), `dlq_raw` (the raw record to `<queue>.dlq`, then ack), `unsettled` (the write failed: neither acked nor retried, reported), `native` (`sqs` and `asb` only: left to the broker's native mechanism, reported). With dead-lettering off and a strategy other than `dead_letter` the outcome is `ack` on `pulsar` and `artemis` and `native` on `sqs` and `asb`. Every `dlq_raw` row carries `expect.record: incoming_body`: the record body equals the incoming body byte for byte and has no `dead_letter` block, checked against each body of `incoming_bodies` (raw bodies in deliberately non-canonical form, so a writer that re-encodes fails). `expect.outcome_no_writer` is present exactly on the `dead_letter` strategy with `dead_letter: off`: a runner for an SDK in which "off" means no DLQ writer exists (no publisher, sender or queue URL) asserts it instead of `expect.outcome` (`ack` on `pulsar` / `artemis`, `native` on `sqs` / `asb`). The trigger (which property values gate) is not part of these sections; the per-binding `schema_version_gate` blocks lock it. Kafka and RabbitMQ are out of scope. |
+
+**One section per binding.** Like `redis_delay`, each `version_gate_<binding>` section has exactly one scope
+(ADR-0032 §2): a package carrying the binding runs and reports all 17 cases of its section, and a package
+that does not carry it has no such section in its results. There is no row-level scope.
+
+**Laravel (ADR-0037 decision 4, GR-6).** The Laravel `babelqueue-sqs` and Artemis drivers keep their own
+version-gate handling (`BabelQueueDispatcher`): with the DLQ enabled they publish an envelope with a
+`dead_letter` block, with it disabled they throw and let `failed_jobs` take the message. They therefore
+cannot satisfy `version_gate_sqs` / `version_gate_artemis`. The Laravel package reports **every case** of
+each of those two sections as `skip` with the reason `ADR-0037 decision 4`; that is the explicit,
+ADR-backed use of `skip` the results format allows, not an omission. Symfony is not covered by the
+exception.
+
+**Producer-only transports.** A package whose SQS or Artemis (STOMP) transport only produces (for example
+`php-sdk` `SqsTransport` / `StompTransport`) has no consumer to settle a delivery with. It follows the rule
+the existing `sqs` / `artemis` binding sections already apply to a produce-only transport (the
+consume-side cases are `n/a`, footnote below the `sqs` table): it reports each case of
+`version_gate_sqs` / `version_gate_artemis` as `skip`, with a reason that cites `ADR-0037` and says the
+package has no consumer for the binding. The rows belong to packages that ship a consumer.
+
+**`poison_dlq` is required in more runners.** The existing `poison_dlq` section (ADR-0035, 1.6.0) is
+required for the runners of the Artemis, SQS and Azure Service Bus packages of Java, .NET and Node, and for
+`@babelqueue/bullmq` (ADR-0037 decisions 2 and 3). Each such runner drives the cases through the record
+builder its consumer actually uses (`PoisonRecord` / `buildPoisonRecord` or the package's own writer), so a
+package cannot pass while its consumer writes a different shape. No case changes.
+
+What stays outside conformance (no broker-less test): the DLQ write itself and ack-after-write against a
+live broker, the native mechanisms (SQS `RedrivePolicy`, Azure Service Bus `$DeadLetterQueue`), the bullmq
+failed set and `UnrecoverableError`, Laravel `failed_jobs`, and the Node Redis `deadLetterQueue: null`
+setting. Each package covers them in its own tests and in the live interop proofs.
+
 ## Results format (ADR-0032)
 
 A conformance run emits one `results.json`, validated by `schema/results.schema.json` (see
@@ -558,6 +597,13 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 `babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
 
 ## Suite version history
+
+- **1.8.0** — ADR-0037.
+  Adds the sections `version_gate_pulsar`, `version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` (one scope
+  each: the version-gate settle rule, `ack` | `dlq_raw` | `unsettled` | `native`, with byte-for-byte raw records) and makes `poison_dlq`
+  required for the Artemis, SQS and Azure Service Bus packages of Java, .NET and Node and for
+  `@babelqueue/bullmq`. Additive: no v1.7.0 case or expectation changed; `fetch.sh` is untouched. An SDK that
+  has not implemented ADR-0037 fails the new section until its parity phase lands. See `CHANGELOG.md`.
 
 - **1.7.0** — ADR-0036.
   Adds the sections `identity_verdict` (`core`: every `kafka_poison` body, `no_identity` mapped to `poison`)

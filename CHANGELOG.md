@@ -5,6 +5,59 @@ All notable changes to the conformance suite. The version is `CONFORMANCE_VERSIO
 case that contradicted the contract, which a MINOR may correct and must list explicitly). The
 per-version prose history lives in `README.md` under "Suite version history".
 
+## 1.8.0
+
+Governing decision: ADR-0037 (poison shape and version-gate parity), with ADR-0035 (poison DLQ record)
+and ADR-0036 (post-R1 parity).
+
+### Added
+
+- Sections `version_gate_pulsar`, `version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` (one scope
+  each, as `redis_delay`; ADR-0032 §2, ADR-0037 decision 1, broker-bindings sections 5.7, 7.7, 3.7 and 4.7):
+  17 cases per section, 68 in all, `{name, on_unknown_urn?, dead_letter, dlq_write?, bq_attempts?, expect}`.
+  The version-gate settle rule as a pure function: `expect.outcome` is `ack` | `dlq_raw` | `unsettled` |
+  `native`, for the strategies `fail` (absent) / `release` / `delete` / `dead_letter`, dead-lettering `on` /
+  `off`, and the DLQ write `ok` / `fails` (absent = `ok`). With dead-lettering off the result is `ack` on
+  Pulsar and Artemis and `native` (left to the broker's native mechanism) on SQS and Azure Service Bus. The
+  optional `expect.outcome_no_writer` is present exactly on the `dead_letter` strategy with dead-lettering
+  off (an SDK without a DLQ writer asserts it instead of `outcome`). `bq_attempts` rows show the outcome
+  does not depend on the attempts count (no retry). The four sections hold the same 17 inputs.
+- `expect.record: incoming_body` on every `dlq_raw` row, and the section member `incoming_bodies` (3 raw
+  bodies, deliberately not in canonical form: pretty-printed with `\u` and `\/` escapes, non-canonical key
+  order and number forms, and a non-JSON body): the record written to `<queue>.dlq` must equal the incoming
+  body byte for byte and carry no `dead_letter` block, so a writer that decodes and re-encodes fails.
+- `ci.yml` step "v1.8 sections agree with their reference oracles": recomputes every `version_gate_<binding>`
+  `expect` with an independent reference settle function (once with a DLQ writer for `outcome`, once
+  without for `outcome_no_writer`, which must be present exactly where the two differ), requires each
+  section's `sections` entry to be exactly its binding scope, `dlq_write` exactly on rows that write (and
+  on the `dead_letter`-with-dead-lettering-off rows), `record` exactly on `dlq_raw` rows, full coverage per
+  section (strategy x dead-lettering x write result, `bq_attempts` with dead-lettering on and off, every
+  outcome of the binding), identical case inputs and `incoming_bodies` across the four sections, and that
+  every `incoming_bodies` entry differs from its canonical re-encodings.
+
+### Changed
+
+- `CONFORMANCE_VERSION`, `manifest.json` `conformance_version` and `schema/results.example.json` carry
+  `1.8.0`. The `sections` map gained `version_gate_pulsar`, `version_gate_artemis`, `version_gate_sqs` and
+  `version_gate_asb` (one binding scope each).
+- `poison_dlq` (ADR-0035, 1.6.0) becomes **required** for the runners of the Artemis, SQS and Azure
+  Service Bus packages of Java, .NET and Node and for `@babelqueue/bullmq` (ADR-0037 decision 2 and 3).
+  No `poison_dlq` case changes: each runner drives the cases through the record builder its consumer
+  actually uses. Documented in `README.md`.
+
+### Compatibility
+
+- No v1.7.0 case or expectation changed; `fetch.sh` and `schema/results.schema.json` are untouched, so the
+  `BQ_FETCH_SH_SHA256` pins stay valid. A runner that enumerates sections from the `sections` map picks the
+  new sections up; an SDK that has not implemented ADR-0037 fails it until its parity phase lands.
+- Each `version_gate_<binding>` section has exactly one scope, so a package without the binding has no such
+  section (ADR-0032 §2; there is no row-level scope). The Laravel `babelqueue-sqs` and Artemis drivers
+  report every case of `version_gate_sqs` / `version_gate_artemis` as `skip` with reason
+  `ADR-0037 decision 4`; a produce-only transport reports them as `skip` too, citing `ADR-0037` and the
+  missing consumer. See `README.md`, "Added in 1.8.0".
+- The release asset is published from the `v1.8.0` tag by the maintainer; until then SDK repositories
+  vendor this suite from the local checkout with `sync.sh`.
+
 ## 1.7.0
 
 Governing decision: ADR-0036 (post-R1 parity), with ADR-0032 (suite structure and the identity rule,
