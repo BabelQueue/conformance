@@ -537,13 +537,18 @@ jobs:
               total += 1
 
           # ---- traceparent (ADR-0028 / ADR-0025) ---------------------------------------
-          TP = re.compile(r"^00-([0-9a-fA-F]{32})-([0-9a-fA-F]{16})-([0-9a-fA-F]{2})$")
+          # W3C Trace Context, version 00 only: lower-case hex, an all-zero trace-id or parent-id is invalid, and
+          # fullmatch so that a trailing newline is not accepted (Python `$` matches before it). Future versions
+          # (01..fe) and reserved flag bits are deliberately not pinned.
+          TP = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
           traceparent = manifest["traceparent"]
           names_unique("traceparent", traceparent["cases"])
           for case in traceparent["cases"]:
               assert case["mode"] == "extract"
               header = case["traceparent"]
-              m = TP.match(header) if isinstance(header, str) else None
+              m = TP.fullmatch(header) if isinstance(header, str) else None
+              if m and (set(m.group(1)) == {"0"} or set(m.group(2)) == {"0"}):
+                  m = None
               if m:
                   want = {"source": "traceparent", "trace_id_hex": m.group(1), "parent_span_id": m.group(2), "flags": m.group(3)}
               else:
