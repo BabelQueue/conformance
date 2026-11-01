@@ -5,6 +5,75 @@ All notable changes to the conformance suite. The version is `CONFORMANCE_VERSIO
 case that contradicted the contract, which a MINOR may correct and must list explicitly). The
 per-version prose history lives in `README.md` under "Suite version history".
 
+## 1.9.0
+
+Governing decisions: ADR-0038 (OpenTelemetry semantic-conventions alignment, span shape and the non-UUID
+`trace_id` rule) and ADR-0039 (standard metrics and the dead-letter observer), with ADR-0032 (section 2,
+the `otel` scope) and ADR-0028 (`traceparent`). R1 OTel plan, phase 02.
+
+### Added
+
+- Section `span-shape` (scope `otel`): 37 cases `{name, mode: span, operation, system?, queue?, urn,
+  consumer_group?, trace_id?, message_id?, attempts?, schema_version?, outcome, expect}` (ADR-0038 section 4).
+  `expect` is the span name, the span kind (`PRODUCER` | `CONSUMER`), the status and the attribute map (every
+  listed key present with that value; a table key not listed must be absent; an extra `babelqueue.*` key is
+  forbidden, an extra semconv-defined attribute is allowed, as the ADR permits), including the deprecated transition keys `messaging.operation` and `messaging.babelqueue.attempts` that are
+  dual-emitted for one MINOR (ADR-0038 section 5). Covers: the seven broker `system` values, a custom
+  `system` (written as given), an absent and an empty `system` (`babelqueue`), Kafka with `consumer_group`
+  (and the group on a non-Kafka system, and Kafka without it), an empty, absent and blank `meta.queue` on
+  consume (bare `process` name, no `messaging.destination.name`) and an absent or empty queue given to a
+  producer (the SDK resolves it, so the expectation is the placeholder `$produced.meta.queue`), an absent `meta.id`, `attempts` 0 and > 0, a
+  non-UUID and a whitespace-padded `trace_id` in `messaging.message.conversation_id`, and a failing publish
+  and handler (`error.type` presence is asserted, never its language-specific value). A producer cannot fix
+  `meta.id` and stamps the active trace's id into `trace_id`, so `send` cases carry no such input and use the
+  placeholders `$produced.meta.id`, `$produced.trace_id` and, for an absent or empty queue, `$produced.meta.queue`, which the
+  runner replaces with the produced envelope's values. The case where the envelope is never built does not pin the destination
+  (`optional_attributes`, `span_name_one_of`), because ADR-0038 only says the producer SHOULD resolve the queue
+  before it starts the span.
+- Section `trace-id` (scope `otel`): 43 cases (ADR-0038 section 7, `message-envelope.md` sections 5.1 and 7
+  rule 2). `map` (22): the OTel TraceID mapping, pinned to the Go reference `otel.TraceIDOf` (a UUID, with or
+  without hyphens and in any case, decodes; the all-zero value, a non-UUID and a value with a leading or
+  trailing ASCII space or a trailing newline are hashed over the raw bytes, SHA-256 first 16 bytes). `decode` (6), `reemit` (6) and
+  `downstream` (4): a non-UUID `trace_id` is preserved byte for byte, never rejected or regenerated. `make`
+  (5): a caller-supplied non-UUID `trace_id` is stored with only the ADR-0032 ASCII trim.
+- Section `metrics` (scope `otel`): 29 cases (ADR-0039). `instrument` (5): name, kind, unit and attribute key
+  set of `messaging.process.duration`, `messaging.client.sent.messages`, `messaging.client.consumed.messages`,
+  `babelqueue.retries` and `babelqueue.dlq.messages`, plus the attributes that must never appear. `publish`
+  (5) and `consume` (7): scenario cases with the exact recorded data points (one successful consume, a failing
+  consume with `attempts` 2, no destination, no meter). `dead_letter` (12): observer-level cases (the five `observer_called: false` cases carry `sdk_test_required: true`: a runner can only report them `pass` trivially, so each SDK's own test must assert the rule) for
+  `babelqueue.dlq.messages` (ADR-0039 section 5.1, owner decision 2026-10-31): +1 for a successful BabelQueue
+  DLQ write and for a successful SDK-initiated native dead-letter (same attribute set, no native/BabelQueue
+  split), 0 for a failed write, a failed native call, a native no-op (SQS), a broker's own dead-letter and a
+  disabled DLQ. The cases are defined at the level of the observer event `{queue, dead_letter_queue,
+  reason}`, so a runner needs no broker.
+- `traceparent`: six cases for the finer W3C validity rules (ADR-0028), all "ignored, behaves like no header" (`source: trace_id`): `version-ff-ignored`, `zero-trace-id-ignored`, `zero-parent-id-ignored`, `uppercase-trace-id-ignored`, `uppercase-parent-id-ignored` and `uppercase-flags-ignored`. The section now has 20 cases.
+
+### Changed
+
+- `CONFORMANCE_VERSION`, `manifest.json` `conformance_version` and `schema/results.example.json` carry
+  `1.9.0`. The `sections` map gained `span-shape`, `trace-id` and `metrics` (scope `otel` each).
+  `results.example.json` gained one abbreviated block per new section.
+- The `traceparent` section `description` no longer says the finer W3C rules and the producer side "are left
+  to the R1 OTel plan": it now states the finer validity rules (version `ff`, all-zero trace-id or parent-id,
+  upper-case hex) and that the producer side is covered by each SDK's own transport tests. No existing
+  `traceparent` case or expectation changed.
+- `ci.yml` step "v1.5 sections agree with their reference oracles": the `traceparent` oracle now matches
+  lower-case hex only and treats an all-zero trace-id or parent-id as invalid, so it agrees with the W3C Trace
+  Context rules the new cases pin (the old pattern accepted upper-case hex and zero ids). It uses `fullmatch`,
+  so a header with a trailing newline is not accepted. Only version `00` is pinned; future versions and reserved
+  flag bits are not.
+
+### Compatibility
+
+- No v1.8.0 case or expectation changed; `fetch.sh` and `schema/results.schema.json` are untouched. The PHP
+  `Tracing::remoteParentFromHeaders` does not yet pass `uppercase-flags-ignored` (R1 OTel plan, phase 08). A runner
+  that enumerates sections from the `sections` map picks the new sections up; an SDK whose `otel` module has
+  not implemented ADR-0038 / ADR-0039 fails them until its parity phase lands.
+- The new sections have scope `otel`, so a package lists `otel` in `bindings` (and runs them) when it
+  carries the optional OpenTelemetry module.
+- The release asset is published from the `v1.9.0` tag by the maintainer; until then SDK repositories vendor
+  this suite from the local checkout with `sync.sh`.
+
 ## 1.8.0
 
 Governing decision: ADR-0037 (poison shape and version-gate parity), with ADR-0035 (poison DLQ record)

@@ -402,8 +402,9 @@ Draft-07 keyword subset in R1 (**K-17**), together with its own cases.
 Every block of `manifest.json` is a **section**. The top-level `sections` map assigns each
 section exactly one **scope** — `core`, a binding it exercises (`redis`, `amqp`, `sqs`,
 `asb`, `pulsar`, `kafka`, `artemis`; the `rabbitmq` section's scope is `amqp`), or `otel`.
-`otel` is not a broker: it is the optional W3C `traceparent` extract/inject code of ADR-0028
-(in the core of Node and .NET; a separate module for Go, Python, Java and PHP), so only a
+`otel` is not a broker: it is the optional OpenTelemetry code (the W3C `traceparent` extract/inject
+code of ADR-0028 and, since 1.9.0, the spans, metrics and `trace_id` mapping of ADR-0038 / ADR-0039;
+in the core of Node and .NET, a separate module for Go, Python, Java and PHP), so only a
 package that carries it runs the `otel` sections. A runner enumerates sections from this map
 rather than from a hard-coded list, runs the sections whose scope the package carries, and
 **tolerates a section newer than the suite version it implements** (it does not crash on it).
@@ -435,7 +436,7 @@ the contract is silent the section says so in its `description` and tests nothin
 | `job_type` | `core` | ADR-0032 §6: a non-string `job` (null, number, boolean, object, array) is ignored and decode MUST warn; a blank-string `job` falls back to `urn` without a warning; a non-string `urn` is ignored; with no valid identity decode raises. |
 | `delay` | `sqs` | broker-bindings §3.4–3.5: `DelaySeconds` on standard queues, the 900 s cap and FIFO per-message delay raising `BabelQueueException`, and the `ChangeMessageVisibility` timeout of a release. |
 | `backoff` | `kafka` | broker-bindings §6.3–6.5, two separate rules: the requested-delay rule (§6.4: smallest tier ≥ the requested delay, `bq-delay` = the requested delay, `bq-original-topic`; reject above the largest tier) and the retry/release rule (§6.5: tier `n = min(attempts_before, N−1) + 1`, `bq-delay` = that tier's ms, `bq-attempts = attempts_before + 1`, `bq-original-topic`, body `attempts` in sync; no tiers configured is rejected). The two rules are not merged. |
-| `traceparent` | `otel` | ADR-0028 / ADR-0025: consumer-side extraction of the W3C `traceparent` header (valid header wins, malformed or absent header falls back to the `trace_id`-derived hex, never raises). Only the `00-<32hex>-<16hex>-<2hex>` structure is pinned; the finer W3C rules and the out-of-band carriage on a real transport are left to the R1 OTel plan. |
+| `traceparent` | `otel` | ADR-0028 / ADR-0025: consumer-side extraction of the W3C `traceparent` header (valid header wins, malformed or absent header falls back to the `trace_id`-derived hex, never raises). The `00-<32hex>-<16hex>-<2hex>` structure is pinned, and (1.9.0) the finer W3C rules: a header with version `ff`, an all-zero trace-id or parent-id, or any upper-case hex is ignored; the out-of-band carriage on a real transport is covered by each SDK's own transport tests, not by this section. |
 | `redis_layout` | `redis` | broker-bindings §1.1: the key names of the Laravel-compatible layout (`queues:<q>`, `:delayed`, `:reserved`, `:notify`). In 1.5.0 names only; 1.6.0 adds behavioural blocks (below). |
 
 ### Added in 1.6.0 (ADR-0033, ADR-0034, ADR-0035)
@@ -534,13 +535,32 @@ live broker, the native mechanisms (SQS `RedrivePolicy`, Azure Service Bus `$Dea
 failed set and `UnrecoverableError`, Laravel `failed_jobs`, and the Node Redis `deadLetterQueue: null`
 setting. Each package covers them in its own tests and in the live interop proofs.
 
+### Added in 1.9.0 (ADR-0038, ADR-0039)
+
+Version 1.9.0 locks the OpenTelemetry span shape, the metric set and the non-UUID `trace_id` rule of the R1
+OTel plan. It is a MINOR: three new sections and six `traceparent` cases, no existing case or expectation
+changes. All three sections have scope `otel` and are inline (`expect` in the manifest, no fixture files);
+a package that carries the optional OpenTelemetry module lists `otel` in `bindings` and reports every case.
+
+| Section | Scope | Pins |
+| :--- | :--- | :--- |
+| `span-shape` (new) | `otel` | ADR-0038 section 4 and 5: the producer span (`send <queue>`, kind `PRODUCER`) and consumer span (`process <queue>`, kind `CONSUMER`) for one message, the attribute map (every listed key exact, an extra `babelqueue.*` key forbidden, other semconv keys allowed; broker `messaging.system` from the `system` option, `babelqueue` when absent or empty; `messaging.operation.type` / `.name`; `messaging.destination.name` only when the queue is known; `messaging.message.id`; `messaging.message.conversation_id`; `messaging.consumer.group.name` only when the option is given; `babelqueue.urn`, `babelqueue.schema_version`, `babelqueue.attempts`), the deprecated keys dual-emitted for one MINOR (`messaging.operation`, `messaging.babelqueue.attempts`), the no-destination name `send` / `process`, and `error.type` presence on a failure (value not asserted). 37 cases. |
+| `trace-id` (new) | `otel` | ADR-0038 section 7 and `message-envelope.md` section 5.1: a non-UUID `trace_id` is preserved byte for byte on decode, re-emit and a downstream message, and `make` stores it with only the ADR-0032 ASCII trim; the OTel TraceID mapping (decode a 32-hex UUID with or without hyphens and in any case, hash anything else, including the all-zero value and a value with surrounding ASCII space or a trailing newline) is pinned to the Go reference `otel.TraceIDOf`. 43 cases. |
+| `metrics` (new) | `otel` | ADR-0039: the five instruments (name, kind, unit, attribute key set, forbidden high-cardinality attributes), the data points of one successful and one failing consume, a publish, the no-destination and no-meter cases, and the `babelqueue.dlq.messages` trigger rule at the level of the observer event: a successful BabelQueue DLQ write and a successful SDK-initiated native dead-letter count +1 with one attribute set; a failed write, a failed native call, a native no-op (SQS), a broker's own dead-letter and a disabled DLQ count 0. 29 cases. |
+| `traceparent` | `otel` | Six new cases (`version-ff-ignored`, `zero-trace-id-ignored`, `zero-parent-id-ignored`, `uppercase-trace-id-ignored`, `uppercase-parent-id-ignored`, `uppercase-flags-ignored`): an invalid header is ignored and behaves like no header. |
+
+Case shapes are described in each section's `description`. Producer (`send`) `span-shape` cases use the placeholders `$produced.meta.id` and `$produced.trace_id`, because a producer generates `meta.id` itself and stamps the active trace's id into `trace_id`, and `$produced.meta.queue` where the case gives no usable queue, because the SDK resolves it; the runner substitutes the produced envelope's values. The five `dead_letter` cases with `observer_called: false` are marked `sdk_test_required`: no event is delivered, so a runner reports them `pass` trivially and only the SDK's own transport or core test enforces the rule. Failure cases assert only that `error.type` is a
+present, non-empty string: its value is a language-specific type name (ADR-0038 section 6). The deprecated
+transition keys appear in every `span-shape` expectation until the conformance version that follows their
+removal.
+
 ## Results format (ADR-0032)
 
 A conformance run emits one `results.json`, validated by `schema/results.schema.json` (see
 `schema/results.example.json`): `sdk`, `version`, `conformance_version`, `generated_at`
 (RFC 3339; UTC recommended), `bindings` and `sections` — section → case id → `{"status": "pass" | "fail" | "skip",
 "reason"?}`. `bindings` is **every transport/binding the package carries**, derived from its
-modules (`otel` when it carries the traceparent code), and it **MUST be complete**: leaving a
+modules (`otel` when it carries the OpenTelemetry module: the traceparent code and, since 1.9.0, spans and metrics), and it **MUST be complete**: leaving a
 carried binding out is not a way to narrow the scope. A real file lists every case of every
 in-scope section; `schema/results.example.json` is abbreviated. A `skip` is only for an
 individual case of an in-scope section and MUST carry a `reason` that cites the ADR which makes
@@ -597,6 +617,14 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 `babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
 
 ## Suite version history
+
+- **1.9.0** — ADR-0038, ADR-0039.
+  Adds the `otel`-scoped sections `span-shape` (the producer and consumer span name, kind and exact attribute
+  map, with the deprecated transition keys), `trace-id` (the non-UUID `trace_id` rule and the OTel TraceID
+  mapping) and `metrics` (the five instruments, their data points and the `babelqueue.dlq.messages` trigger
+  rule), plus six `traceparent` cases for the finer W3C validity rules. Additive: no v1.8.0 case or expectation changed;
+  `fetch.sh` and `schema/results.schema.json` are untouched. An SDK that has not implemented ADR-0038 /
+  ADR-0039 fails the new sections until its parity phase lands. See `CHANGELOG.md`.
 
 - **1.8.0** — ADR-0037.
   Adds the sections `version_gate_pulsar`, `version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` (one scope
