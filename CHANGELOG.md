@@ -5,6 +5,45 @@ All notable changes to the conformance suite. The version is `CONFORMANCE_VERSIO
 case that contradicted the contract, which a MINOR may correct and must list explicitly). The
 per-version prose history lives in `README.md` under "Suite version history".
 
+## 1.10.0
+
+Governing decisions: ADR-0024 (SDK payload schema validation) and K-17 (the dependency-free Draft-07 subset:
+`type`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`, `minLength`, `maxLength`,
+`minimum`). R1 parity plan, phase 01.
+
+### Added
+
+- Section `payload_schema_keywords` (scope `core`): 66 cases `{name, schema, data, valid, warnings?}`; each case
+  carries its own `schema`, and `warnings` is a list of `{pointer, keyword}` pairs. It pins three behaviours on
+  which the six SDK validators differed:
+  - Union `type`: an array of type names is valid when the value matches any of them; `integer` accepts `1.0`,
+    `1e0` and `1e2` and rejects `1.5`; at the root, in nested `properties` and in `items`.
+  - Numeric equality in `const` and `enum`: numbers compare by mathematical value (`1` = `1.0` = `1e0`,
+    `2.5` = `2.50`), recursively inside arrays and objects; `true` is not `1`, `"1"` is not `1`, `null` equals only
+    `null`.
+  - Unsupported keywords: the verdict is unchanged (the keyword is evaluated as absent) and registration produces
+    exactly one warning `{pointer, keyword}` per unsupported keyword occurrence. `pointer` is the RFC 6901 pointer
+    of the schema object carrying the keyword (root `""`, then `/properties/<name>`, `/items`,
+    `/additionalProperties`, with `~0` / `~1` escaping). The expected warnings are compared as a set; the message
+    text is the SDK's own. The walk never descends into the value of an unsupported keyword. Annotations never
+    warn: `$schema`, `$id`, `title`, `description`, `examples`, `default`, `$comment` and every `x-` keyword
+    (for example `x-gdpr-sensitive`, ADR-0030).
+  - `maxLength` counted in Unicode code points (five cases that tell code points apart from UTF-8 bytes, UTF-16 units and graphemes), complementing `payload_schema_unicode`, which stays
+    `minLength`-only.
+- `sections.payload_schema_keywords` = `{ "scope": "core" }`.
+
+### Compatibility
+
+- No v1.9.0 case or expectation changed; `fetch.sh`, `sync.sh`, `schema/results.schema.json` and
+  `fixtures/*.json` are untouched. A runner that enumerates sections from the `sections` map picks the new
+  section up; an SDK whose payload validator has not implemented the three rules fails it until its parity
+  phase (R1 parity plan, phases 02-04) lands.
+- The cases whose schema uses a keyword that full Draft-07 enforces (`pattern`, `maximum`, `allOf`, `$ref`) have
+  the subset's verdict, so the reference Draft-07 cross-check of this repo's CI does not cover this section.
+- The wire envelope is unchanged (`schema_version: 1`).
+- The release asset is published from the `v1.10.0` tag by the maintainer; until then SDK repositories vendor this
+  suite from the local checkout with `sync.sh`.
+
 ## 1.9.0
 
 Governing decisions: ADR-0038 (OpenTelemetry semantic-conventions alignment, span shape and the non-UUID

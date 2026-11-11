@@ -221,9 +221,9 @@ three-method `Store` interface (`seen` / `remember` / `forget`) backs a shared
 Redis/DB store for a fleet — the contract here is **store-agnostic**, it asserts the
 decision sequence, not a backend.
 
-## Behaviour conformance (`manifest.json` → `roundtrip`, `data_shape`, `forbidden_keys`, `payload_schema_unicode`, `extension_write`, `encode_reject`)
+## Behaviour conformance (`manifest.json` → `roundtrip`, `data_shape`, `forbidden_keys`, `payload_schema_unicode`, `payload_schema_keywords`, `extension_write`, `encode_reject`)
 
-These six blocks lock **behaviour** every SDK core must share on top of the envelope
+These seven blocks lock **behaviour** every SDK core must share on top of the envelope
 `cases` — what happens when a message is decoded and written back. A runner that does
 not know a block skips it (all existing runners look sections up by name), so adding a
 block never turns an old runner red. JSON pointers are **RFC 6901** (`/meta/vendor_flag`).
@@ -394,8 +394,60 @@ units (Java/.NET/JS `length`), not grapheme clusters (.NET `StringInfo`).
 | `emoji-plus-ascii-2cp-min3` | `"😀a"` | 3 | 2 (3 UTF-16 units) | invalid |
 | `combining-2cp-min2` | `"é"` (é, decomposed) | 2 | 2 (1 grapheme) | valid |
 
-`maxLength` is deliberately **not** covered: no SDK supports it yet. It arrives with the
-Draft-07 keyword subset in R1 (**K-17**), together with its own cases.
+`maxLength` is not covered by this section: it arrived with the Draft-07 keyword subset in
+1.10.0 (**K-17**) and its cases are in `payload_schema_keywords` below.
+
+### `payload_schema_keywords` — union types, numeric equality, unsupported keywords (1.10.0)
+
+Scope `core`. Governing decisions: ADR-0024 (SDK payload schema validation) and K-17 (the dependency-free
+Draft-07 subset: `type`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`,
+`minLength`, `maxLength`, `minimum`). The section pins the three points on which the six SDK validators
+used to differ. It is inline and opt-in like `payload_schema`; the wire envelope is untouched
+(`schema_version: 1`).
+
+Shape: `{ "description", "cases": [{ "name", "schema", "data", "valid", "warnings"? }] }`. Unlike
+`payload_schema`, **each case carries its own `schema`**. The runner registers the case's `schema` and
+collects the warnings that registration produces, then validates `data` and asserts `valid` **and** the
+warning set. The case id in `results.json` is the `name`.
+
+| Rule | Behaviour pinned |
+| :--- | :--- |
+| Union `type` | `type` may be an array (`["string", "null"]`); the value is valid if it matches ANY listed type. `integer` accepts every integral number (`1.0`, `1e0`, `1e2` valid; `1.5` invalid). `boolean` never matches `0`/`1`; `null` matches only `null`. Works at the root, inside nested `properties` and in `items`. |
+| Numeric equality in `const` / `enum` | Numbers compare by mathematical value: `1`, `1.0` and `1e0` are equal, `2.5` equals `2.50`. The rule is recursive through arrays (in order) and objects (key order irrelevant, key set equal). `true` is not `1`, `false` is not `0`, `"1"` is not `1`, `null` equals only `null`. A runner MUST NOT reject or normalise a number literal such as `1.0` before comparing. |
+| Unsupported keyword | Does **not** change the verdict (it is evaluated as if absent), but registration produces exactly one warning per unsupported keyword occurrence. |
+
+**Warning comparison rule.** A warning is `{ "pointer", "keyword" }`. `pointer` is the RFC 6901 JSON Pointer,
+inside the schema document, of the schema object that carries the keyword (the root is `""`; then
+`/properties/<name>`, `/items`, `/additionalProperties`; `~` is written `~0` and `/` is written `~1` in a
+property name). The expected warnings are the case's `warnings` list compared as a **set** of
+`{pointer, keyword}` pairs: order is irrelevant, the message text is the SDK's own and is never compared,
+and an absent `warnings` field means the expected set is empty (the runner asserts that no warning is
+produced). The walk descends only into the object values of `properties`, `items` and
+`additionalProperties`; it never descends into the value of an unsupported keyword (`allOf`,
+`definitions`, ...), which counts as one warning, and the names inside `properties` are property names, not
+keywords (a property called `title` or `pattern` does not warn).
+
+**Annotations never warn:** `$schema`, `$id`, `title`, `description`, `examples`, `default`, `$comment`, and
+every keyword starting with `x-` (for example the ADR-0030 `x-gdpr-sensitive`). Everything else outside the
+ten supported keywords is unsupported, including `maximum`, `pattern`, `format`, `maxItems`, `$ref`,
+`definitions`, `allOf` and `multipleOf`.
+
+Because an unsupported keyword is evaluated as absent, a case that uses one a full Draft-07 validator
+enforces (`pattern`, `maximum`, `allOf`, `$ref`) has the **subset's** verdict, not Draft-07's. For that
+reason the reference Draft-07 cross-check of this repo's CI does not cover this section.
+
+| Group | Cases |
+| :--- | :--- |
+| Union types | `union-string-null-*` (string, null valid; number, boolean invalid), `union-integer-null-*` (`1.0`, `1e2`, null valid; `1.5` invalid), `union-integer-boolean-rejects-numeric-string`, `type-integer-*`, `union-nested-*` (nested `properties`, `minimum` still applies), `union-items-*` |
+| `const` numeric equality | `const-number-*` (`1` against `1`, `1.0`, `1e0` valid; `true`, `"1"`, `1.5`, `null` invalid), `const-1.0-accepts-integer-1`, `const-true-rejects-1`, `const-false-rejects-0`, `const-null-*` |
+| `enum` numeric equality | `enum-numbers-*` (`[1, 2.5]` against `2.50`, `1.0` valid; `3`, `"1"`, `true` invalid), `enum-mixed-*`, `enum-object-*` |
+| Recursive equality | `const-object-*` (`{"a":[1]}` against `{"a":[1.0]}` valid; `[true]`, longer array, extra key, reordered array invalid; key order ignored) |
+| Unsupported keywords | `unsupported-*`: `pattern` / `format` / `maxItems` / `maximum` / `minProperties` / `multipleOf` / `$ref` / `allOf` / `definitions` at the root, in `properties`, `items`, `additionalProperties` and deeply nested; pointer escaping; one warning per occurrence; a container keyword is one warning and not descended |
+| Annotations and non-warnings | `annotations-never-warn`, `x-prefixed-keywords-never-warn`, `annotation-and-unsupported-mixed-warns-only-for-unsupported`, `property-names-are-not-keywords`, `all-supported-keywords-produce-no-warnings` |
+| `maxLength` (code points) | `max-length-*`: `"abc"` and `"ğüş"` (3 code points, 6 UTF-8 bytes) and three emoji (3 code points, 6 UTF-16 units) against `maxLength` 3 valid (a byte counter rejects the Turkish and emoji values, a UTF-16 counter rejects the emoji value); four emoji against 3 invalid; decomposed `é` (2 code points, 1 grapheme) against `maxLength` 1 invalid (a grapheme counter accepts it) |
+
+An SDK whose validator has not implemented these rules fails the section until its parity phase lands
+(R1 parity plan, phases 02-04).
 
 ## Sections, scopes and exceptions (1.5.0, ADR-0032)
 
@@ -618,6 +670,13 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 
 ## Suite version history
 
+- **1.10.0** — ADR-0024, K-17.
+  Adds the `core`-scoped section `payload_schema_keywords` (66 cases): union `type` arrays, numeric equality in
+  `const` / `enum` (recursive; `1` = `1.0` = `1e0`, `true` is not `1`), the one-warning-per-unsupported-keyword
+  registration rule with the annotation exceptions, and `maxLength` in code points. Additive: no v1.9.0 case or
+  expectation changed; `fetch.sh`, `sync.sh` and `schema/results.schema.json` are untouched. An SDK whose payload
+  validator has not implemented these rules fails the new section until its parity phase lands. See `CHANGELOG.md`.
+
 - **1.9.0** — ADR-0038, ADR-0039.
   Adds the `otel`-scoped sections `span-shape` (the producer and consumer span name, kind and exact attribute
   map, with the deprecated transition keys), `trace-id` (the non-UUID `trace_id` rule and the OTel TraceID
@@ -704,6 +763,8 @@ Drift is guarded automatically:
   `jsonschema`): roundtrip/forbidden-key fixtures pass the envelope schema (except
   `producer_schema_valid: false`), `data-array-rejected` fails it, every pointer exists
   in its fixture, and the `payload_schema_unicode` verdicts match.
+  `payload_schema_keywords` is outside that cross-check: its verdicts are the subset's, not Draft-07's
+  (see its section above); the SDK runners are its oracle.
 
 So, to release a suite change: edit fixtures here → bump `CONFORMANCE_VERSION` → commit, push
 and tag `vX.Y.Z` → `./sync.sh` → in each SDK, commit the vendored copy together with the
