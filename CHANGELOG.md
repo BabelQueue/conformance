@@ -5,6 +5,39 @@ All notable changes to the conformance suite. The version is `CONFORMANCE_VERSIO
 case that contradicted the contract, which a MINOR may correct and must list explicitly). The
 per-version prose history lives in `README.md` under "Suite version history".
 
+## 1.11.0
+
+Governing decisions: ADR-0040 (open producer-language tag). R2 plan (R2-E4), phase 02.
+
+### Added
+
+- Roundtrip case `malformed-lang` (`fixtures/malformed-lang.json`): `meta.lang: "Rust 1"` does not match the open
+  tag pattern `^[a-z][a-z0-9-]*$`, so the fixture is flagged `producer_schema_valid: false`. A consumer decodes it
+  without error and re-emits `meta.lang` unchanged (`expect_attempts` 1, `/meta/lang` = `"Rust 1"`).
+
+### Changed
+
+- `schema/message-envelope.schema.json`: `meta.lang` and `dead_letter.lang` are `{"type": "string", "pattern":
+  "^[a-z][a-z0-9-]*$"}` instead of the enum `php | go | python | java | dotnet | node`. The file is byte-identical to
+  `.ssot/contracts/message-envelope.schema.json`.
+
+### Corrected
+
+- Roundtrip case `unknown-lang`: the `producer_schema_valid: false` flag is removed. This is the one existing
+  expectation that changes, and it changes because it contradicted the contract: with `lang` an open pattern,
+  `"cobol"` matches it and the fixture passes the producer schema. Its consumer behaviour (decode without error,
+  re-emit `"cobol"`) is unchanged.
+
+### Compatibility
+
+- No other case or expectation changed; `fetch.sh`, `sync.sh`, `schema/results.schema.json` and the other
+  `fixtures/*.json` are untouched. The wire envelope is unchanged (`schema_version: 1`); only the schema's
+  description of `lang` was widened. A runner that ignores `producer_schema_valid` and an SDK that already
+  passes `unknown-lang` need no change; a runner that read `producer_schema_valid: false` on `unknown-lang` as
+  "must fail the schema" must drop that assumption.
+- `CONFORMANCE_VERSION`, `manifest.json` `conformance_version` and `schema/results.example.json` are `1.11.0`. The
+  release asset is published from the `v1.11.0` tag in a later phase (R2 phase 05).
+
 ## 1.10.0
 
 Governing decisions: ADR-0024 (SDK payload schema validation) and K-17 (the dependency-free Draft-07 subset:

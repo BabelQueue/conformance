@@ -270,7 +270,8 @@ so an old runner stays green but does not cover the DLQ path until it is wired.
 | :--- | :--- |
 | `unknown-meta-roundtrip` | `meta.vendor_flag` (`true`) and nested `meta.vendor_ctx` come back unchanged; `attempts` 0 → 1. |
 | `unknown-toplevel-roundtrip` | Top-level `extra_top` (`1`) comes back unchanged; `attempts` 1 → 2. |
-| `unknown-lang` | `meta.lang: "cobol"` decodes without error and is re-emitted as `"cobol"`. |
+| `unknown-lang` | `meta.lang: "cobol"` decodes without error and is re-emitted as `"cobol"`. Since 1.11.0 it matches the open tag pattern and passes the producer schema (ADR-0040). |
+| `malformed-lang` | (1.11.0) `meta.lang: "Rust 1"` (does not match `^[a-z][a-z0-9-]*$`) decodes without error and is re-emitted as `"Rust 1"` (ADR-0040 consumer tolerance); `attempts` 0 → 1. |
 | `empty-data-roundtrip` | `data: {}` comes back as an **object** `{}`, never `[]`. |
 | `wrong-case-keys-roundtrip` | A valid envelope that also carries `JOB`, `Data` and `meta.Queue`: the canonical `job` / `data` / `meta.queue` are unchanged and the three wrongly cased keys come back with their own values; `attempts` 0 → 1. |
 | `meta-ext-vendor-roundtrip` | (1.4.0) Vendor blocks under `meta.ext.<vendor>` (`acme`, `globex`) with nested objects and arrays come back unchanged (ADR-0031); `attempts` 0 → 1. |
@@ -278,10 +279,12 @@ so an old runner stays green but does not cover the DLQ path until it is wired.
 | `urn-only-roundtrip` | (1.4.0) Only `urn`, no `job`: accepted, the URN is read from `urn`, the re-emit has `/job` = the URN and no `/urn`. No warning (the alias is the identity source). |
 | `blank-ascii-job-urn-fallback` | (1.4.0) `job` is two spaces, `urn` present: the blank `job` counts as absent, so the URN falls back to `urn`; re-emit has `/job` = the URN and no `/urn`. Blank means empty or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`). |
 
-`producer_schema_valid: false` (on `unknown-lang` and `urn-only-roundtrip`) marks a
+`producer_schema_valid: false` (on `malformed-lang` and `urn-only-roundtrip`) marks a
 **consumer-tolerance** fixture: like `urn-alias`, it intentionally fails the producer JSON
-Schema (`meta.lang` is an enum there; `job` is required) but a consumer MUST still accept and
-faithfully re-emit it.
+Schema (`meta.lang` must match `^[a-z][a-z0-9-]*$` there; `job` is required) but a consumer MUST
+still accept and faithfully re-emit it. Until 1.10.0 `unknown-lang` (`"cobol"`) carried the flag
+too, because `meta.lang` was a closed enum; since 1.11.0 (ADR-0040) it is an open pattern, `"cobol"`
+matches it, and the flag is removed from that case.
 
 ### `data_shape` — `data` is always an object
 
@@ -669,6 +672,15 @@ the block's note). The three standalone transport repos (node-adapters, `babelqu
 `babelqueue-dotnet-sqs`) vendor their own copy via `sync.sh` (added to its targets).
 
 ## Suite version history
+
+- **1.11.0** — ADR-0040, R2-E4.
+  Opens the producer-language tag: `meta.lang` and `dead_letter.lang` in `schema/message-envelope.schema.json` are
+  now `^[a-z][a-z0-9-]*$` instead of the six-value enum (the schema is byte-identical to
+  `.ssot/contracts/message-envelope.schema.json`). Adds the roundtrip case `malformed-lang` (`meta.lang: "Rust 1"`,
+  `producer_schema_valid: false`, decoded and re-emitted unchanged). Corrects one existing expectation: `unknown-lang`
+  (`"cobol"`) now matches the pattern, so its `producer_schema_valid: false` flag is removed (the flag contradicted the
+  contract once the enum was opened). No other case changed; `fetch.sh`, `sync.sh` and `schema/results.schema.json` are
+  untouched. See `CHANGELOG.md`.
 
 - **1.10.0** — ADR-0024, K-17.
   Adds the `core`-scoped section `payload_schema_keywords` (66 cases): union `type` arrays, numeric equality in
